@@ -77,6 +77,13 @@ def _build_options(
         model=model,
         allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
         permission_mode="acceptEdits",
+        # The SDK reads NDJSON from the inner Claude CLI; each tool
+        # result is one JSON line. Asm dumps and Ghidra pseudo-C
+        # routinely cross the SDK's 1 MiB default, which raises
+        # "Failed to decode JSON: JSON message exceeded maximum buffer
+        # size" and tears down the whole session. 16 MiB is enough for
+        # every file in ffxivgame's asm/ tree.
+        max_buffer_size=16 * 1024 * 1024,
         hooks={
             "PreToolUse": [HookMatcher(matcher=".*", hooks=[pretool])],
             "PostToolUse": [HookMatcher(matcher=".*", hooks=[posttool])],
