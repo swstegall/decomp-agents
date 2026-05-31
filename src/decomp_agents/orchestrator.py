@@ -53,13 +53,16 @@ class Orchestrator:
             notes=f"binary={self.cfg.binary}, workers={self.cfg.worker_count}",
         )
         log.info(
-            "session %d begun — repo=%s binary=%s workers=%d model=%s auth=%s push=%s "
+            "session %d begun — repo=%s binary=%s workers=%d "
+            "models=triage:%s/default:%s/escalation:%s auth=%s push=%s "
             "post_merge_stamp=%s cross_session_merge=%s",
             self.session_id,
             self.cfg.repo,
             self.cfg.binary,
             self.cfg.worker_count,
+            self.cfg.triage_model,
             self.cfg.worker_model,
+            self.cfg.escalation_model,
             self.cfg.auth_mode,
             self.cfg.autopush,
             "on" if self.cfg.post_merge_stamp else "off",
@@ -467,7 +470,9 @@ def main(dry_run: bool) -> None:
         click.echo(f"  repo            = {cfg.repo}")
         click.echo(f"  binary          = {cfg.binary}")
         click.echo(f"  worker_count    = {cfg.worker_count}")
+        click.echo(f"  triage_model    = {cfg.triage_model}")
         click.echo(f"  worker_model    = {cfg.worker_model}")
+        click.echo(f"  escalation_model= {cfg.escalation_model}")
         click.echo(f"  auth_mode       = {cfg.auth_mode}")
         click.echo(f"  autopush        = {cfg.autopush}")
         click.echo(f"  post_merge_stamp= {'on' if cfg.post_merge_stamp else 'off'}")

@@ -24,8 +24,10 @@ WORKER_MODEL_ALIASES = {
     "haiku": "claude-haiku-4-5-20251001",
 }
 
+TIER_NAMES = ("triage", "default", "escalation")
 
-def _resolve_worker_model(raw: str) -> str:
+
+def _resolve_model(raw: str, *, env_name: str) -> str:
     raw_lower = raw.lower()
     if raw_lower in WORKER_MODEL_ALIASES:
         return WORKER_MODEL_ALIASES[raw_lower]
@@ -34,9 +36,16 @@ def _resolve_worker_model(raw: str) -> str:
     if raw.startswith("claude-"):
         return raw
     raise RuntimeError(
-        f"DECOMP_WORKER_MODEL={raw!r} must be one of {sorted(WORKER_MODEL_ALIASES)} "
+        f"{env_name}={raw!r} must be one of {sorted(WORKER_MODEL_ALIASES)} "
         f"or a full 'claude-...' model id"
     )
+
+
+def _resolve_worker_model(raw: str) -> str:
+    # Kept for backwards compatibility with anything that imports it
+    # directly. New code should use _resolve_model with an explicit
+    # env_name so the error message points at the right variable.
+    return _resolve_model(raw, env_name="DECOMP_WORKER_MODEL")
 
 
 @dataclass(frozen=True)
@@ -57,7 +66,14 @@ class Config:
     anthropic_api_key: str
     auth_mode: str  # "api_key" | "subscription"
     autopush: str   # "none" | "branches" | "branches+master"
-    worker_model: str  # "opus" | "sonnet" | "haiku" | full model id
+    # Per-tier models. classify_tier() in prompt_context picks one of
+    # {triage, default, escalation} per function based on size + sibling
+    # availability + prior bail history; model_for_tier() maps that to
+    # a concrete model id. To disable tiering, set all three to the same
+    # value.
+    triage_model: str       # easy: small + named sibling + Ghidra pseudo-C
+    worker_model: str       # default tier — the "middle" model
+    escalation_model: str   # hard: large, no siblings, or prior bail
     # Post-merge cluster stamping: after a worker's match merges cleanly,
     # check meteor-decomp's reloc-aware cluster JSON for sibling .cpp's
     # that could be byte-identical, stamp them, validate via
@@ -98,6 +114,15 @@ class Config:
 
     def branch_prefix_for(self, agent_id: int) -> str:
         return f"agents/agent-{agent_id}"
+
+    def model_for_tier(self, tier: str) -> str:
+        if tier == "triage":
+            return self.triage_model
+        if tier == "escalation":
+            return self.escalation_model
+        # "default" — and a safety net for anything unrecognised so a
+        # bad classifier never crashes a worker mid-claim.
+        return self.worker_model
 
 
 def _int_env(name: str, default: int) -> int:
@@ -211,8 +236,20 @@ def load_config() -> Config:
             f"DECOMP_AUTOPUSH={autopush!r} must be 'none', 'branches', or 'branches+master'"
         )
 
-    worker_model_raw = os.environ.get("DECOMP_WORKER_MODEL", "opus").strip()
-    worker_model = _resolve_worker_model(worker_model_raw)
+    # Three-tier model selection. Defaults reflect the cost/quality
+    # split documented in CLAUDE.md: haiku for the easy cases (small
+    # function + named sibling + Ghidra pseudo-C), sonnet for the
+    # middle of the pool, opus reserved for the hard cases (no
+    # siblings, large, or a prior bail). Set all three equal to
+    # disable tiering.
+    worker_model_raw = os.environ.get("DECOMP_WORKER_MODEL", "sonnet").strip()
+    worker_model = _resolve_model(worker_model_raw, env_name="DECOMP_WORKER_MODEL")
+
+    triage_model_raw = os.environ.get("DECOMP_TRIAGE_MODEL", "haiku").strip()
+    triage_model = _resolve_model(triage_model_raw, env_name="DECOMP_TRIAGE_MODEL")
+
+    escalation_model_raw = os.environ.get("DECOMP_ESCALATION_MODEL", "opus").strip()
+    escalation_model = _resolve_model(escalation_model_raw, env_name="DECOMP_ESCALATION_MODEL")
 
     return Config(
         repo=repo,
@@ -230,7 +267,9 @@ def load_config() -> Config:
         anthropic_api_key=api_key,
         auth_mode=auth_mode,
         autopush=autopush,
+        triage_model=triage_model,
         worker_model=worker_model,
+        escalation_model=escalation_model,
         post_merge_stamp=_bool_env("DECOMP_POST_MERGE_STAMP", True),
         cross_session_merge=_bool_env("DECOMP_CROSS_SESSION_MERGE", True),
     )

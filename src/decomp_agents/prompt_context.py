@@ -30,6 +30,11 @@ class PromptContext:
     blocked_post_mortem_excerpt: str | None = None
     nearby_types_paths: list[str] = field(default_factory=list)
     nearby_matched_count: int = 0
+    # True iff at least one picked sibling is a hand-named match (not a
+    # FUN_<addr> auto-passthrough). Hand-named siblings carry actual
+    # local idioms and therefore are the signal that this function is
+    # easy enough for the cheapest model tier to copy from.
+    has_named_sibling: bool = False
 
     def to_markdown(self, *, max_iters: int, fn: Function) -> str:
         lines: list[str] = []
@@ -158,6 +163,12 @@ def build_context(
     nearby_types = _nearby_types(repo, fn)
     nearby_matched = _nearby_matched_count(repo, fn)
 
+    # A sibling path looks like `src/<bin>/_rosetta/<safe_symbol>.cpp`;
+    # _safe_symbol preserves the FUN_ prefix on auto-passthrough rows.
+    has_named_sibling = any(
+        not p.stem.startswith("FUN_") for p in siblings
+    )
+
     return PromptContext(
         asm_relpath=str(asm_relpath),
         pseudo_c_relpath=str(pseudo_c) if has_pseudo_c else None,
@@ -169,7 +180,49 @@ def build_context(
         blocked_post_mortem_excerpt=blocked_excerpt,
         nearby_types_paths=[str(p) for p in nearby_types],
         nearby_matched_count=nearby_matched,
+        has_named_sibling=has_named_sibling,
     )
+
+
+# --- model tiering ---------------------------------------------------------
+
+
+# Tunables for classify_tier. Exposed at module scope so tests + callers
+# can reference them by name rather than hard-coding magic numbers.
+TRIAGE_MAX_SIZE = 0x80
+ESCALATION_MIN_SIZE = 0x180
+
+
+def classify_tier(fn: Function, ctx: PromptContext) -> str:
+    """Map a function to one of {triage, default, escalation}.
+
+    Policy:
+      - escalation: any "this is going to be hard" signal — prior bail
+        on disk, large body, or no context at all (no siblings AND no
+        Ghidra pseudo-C).
+      - triage: every "this is going to be easy" signal lines up — small
+        body, hand-named sibling to copy idioms from, and Ghidra pseudo-C
+        as a transcription hint.
+      - default: everything in between.
+
+    The classifier is deliberately conservative on the cheap end (all
+    triage conditions must hold) and trigger-happy on the expensive end
+    (any escalation condition suffices) so we burn opus rather than
+    underspend on a function the cheaper model will fumble.
+    """
+    if ctx.blocked_post_mortem_path:
+        return "escalation"
+    if fn.size > ESCALATION_MIN_SIZE:
+        return "escalation"
+    if not ctx.sibling_paths and not ctx.pseudo_c_relpath:
+        return "escalation"
+    if (
+        fn.size <= TRIAGE_MAX_SIZE
+        and ctx.has_named_sibling
+        and ctx.pseudo_c_relpath
+    ):
+        return "triage"
+    return "default"
 
 
 # --- helpers ---------------------------------------------------------------

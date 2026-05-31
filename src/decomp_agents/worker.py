@@ -30,7 +30,7 @@ from typing import Any
 
 from .config import Config, load_config
 from .hooks import make_posttool_hook, make_pretool_hook
-from .prompt_context import build_context
+from .prompt_context import PromptContext, build_context, classify_tier
 from .prompts import load_worker_system_prompt
 from .work_queue import ClaimRecord, Function, WorkQueue
 from .worktree import current_sha, is_clean, stage_and_commit
@@ -91,9 +91,8 @@ def _build_options(
     )
 
 
-def _function_brief(fn: Function, cfg: Config) -> str:
+def _function_brief(fn: Function, cfg: Config, ctx: PromptContext) -> str:
     """The per-function task prompt fed to the agent for ONE function."""
-    ctx = build_context(fn, repo=cfg.repo)
     max_iters = cfg.max_iterations_per_function
 
     head = f"""You are matching ONE function from {fn.binary}.exe.
@@ -182,6 +181,22 @@ async def _run_function(
     """Drive the SDK loop for one function. Returns (outcome, iterations)."""
     from claude_agent_sdk import query  # type: ignore
 
+    # Build context once and use it for both the brief and the model
+    # tier choice — building it touches a handful of YAML/JSON/disk
+    # reads we don't want to repeat.
+    ctx = build_context(claim.function, repo=cfg.repo)
+    tier = classify_tier(claim.function, ctx)
+    model = cfg.model_for_tier(tier)
+    _emit(
+        {
+            "kind": "tier",
+            "agent_id": agent_id,
+            "claim_id": claim.id,
+            "tier": tier,
+            "model": model,
+        }
+    )
+
     system_prompt = load_worker_system_prompt()
     options = _build_options(
         cwd=cwd,
@@ -191,9 +206,9 @@ async def _run_function(
         claim_id_ref=claim_id_ref,
         transcripts_dir=transcripts_dir,
         agent_id=agent_id,
-        model=cfg.worker_model,
+        model=model,
     )
-    user_prompt = _function_brief(claim.function, cfg).replace(
+    user_prompt = _function_brief(claim.function, cfg, ctx).replace(
         "{max_iters}", str(cfg.max_iterations_per_function)
     )
 

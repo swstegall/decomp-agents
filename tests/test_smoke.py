@@ -146,7 +146,10 @@ def test_worker_model_aliases(monkeypatch, tmp_path):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-foo")
 
     monkeypatch.delenv("DECOMP_WORKER_MODEL", raising=False)
-    assert config.load_config().worker_model == "claude-opus-4-7"
+    # Default tier is the middle ("default") slot. Sonnet now, was opus
+    # before tiering landed — see the model-tiering block in
+    # .env.example for the rationale.
+    assert config.load_config().worker_model == "claude-sonnet-4-6"
 
     monkeypatch.setenv("DECOMP_WORKER_MODEL", "sonnet")
     assert config.load_config().worker_model == "claude-sonnet-4-6"
@@ -154,12 +157,145 @@ def test_worker_model_aliases(monkeypatch, tmp_path):
     monkeypatch.setenv("DECOMP_WORKER_MODEL", "haiku")
     assert config.load_config().worker_model.startswith("claude-haiku-")
 
+    monkeypatch.setenv("DECOMP_WORKER_MODEL", "opus")
+    assert config.load_config().worker_model == "claude-opus-4-7"
+
     monkeypatch.setenv("DECOMP_WORKER_MODEL", "claude-opus-4-7-something")
     assert config.load_config().worker_model == "claude-opus-4-7-something"
 
     monkeypatch.setenv("DECOMP_WORKER_MODEL", "bogus")
     with pytest.raises(RuntimeError, match="DECOMP_WORKER_MODEL"):
         config.load_config()
+
+
+def test_tier_model_aliases_and_defaults(monkeypatch, tmp_path):
+    from decomp_agents import config
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setenv("DECOMP_REPO", str(tmp_path))
+    monkeypatch.setenv("DECOMP_BINARY", "ffxivlogin")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-foo")
+
+    # Defaults: haiku / sonnet / opus.
+    for var in ("DECOMP_TRIAGE_MODEL", "DECOMP_WORKER_MODEL", "DECOMP_ESCALATION_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    cfg = config.load_config()
+    assert cfg.triage_model.startswith("claude-haiku-")
+    assert cfg.worker_model == "claude-sonnet-4-6"
+    assert cfg.escalation_model == "claude-opus-4-7"
+
+    # Per-tier env vars resolve aliases independently.
+    monkeypatch.setenv("DECOMP_TRIAGE_MODEL", "sonnet")
+    monkeypatch.setenv("DECOMP_ESCALATION_MODEL", "claude-opus-4-7-edge")
+    cfg = config.load_config()
+    assert cfg.triage_model == "claude-sonnet-4-6"
+    assert cfg.escalation_model == "claude-opus-4-7-edge"
+
+    # model_for_tier dispatch.
+    assert cfg.model_for_tier("triage") == cfg.triage_model
+    assert cfg.model_for_tier("default") == cfg.worker_model
+    assert cfg.model_for_tier("escalation") == cfg.escalation_model
+    # Unknown tier falls back to default rather than raising — a bad
+    # classifier should not crash a worker mid-claim.
+    assert cfg.model_for_tier("garbage") == cfg.worker_model
+
+    # Error message points at the correct env var.
+    monkeypatch.setenv("DECOMP_TRIAGE_MODEL", "bogus")
+    with pytest.raises(RuntimeError, match="DECOMP_TRIAGE_MODEL"):
+        config.load_config()
+
+
+def test_classify_tier_branches():
+    from decomp_agents.prompt_context import (
+        ESCALATION_MIN_SIZE,
+        PromptContext,
+        TRIAGE_MAX_SIZE,
+        classify_tier,
+    )
+    from decomp_agents.work_queue import Function
+
+    def make_fn(size: int) -> Function:
+        return Function(
+            binary="ffxivlogin",
+            rva=0x00400000,
+            end=0x00400000 + size,
+            size=size,
+            module="net/blowfish",
+            symbol="FUN_00400000",
+            type="matching",
+            status="unmatched",
+            section=".text",
+        )
+
+    def make_ctx(
+        *,
+        size: int,
+        siblings: list[str] = (),  # noqa: B006 — read-only default
+        has_named: bool = False,
+        pseudo_c: bool = False,
+        blocked: bool = False,
+    ) -> PromptContext:
+        return PromptContext(
+            asm_relpath="asm/ffxivlogin/x.s",
+            pseudo_c_relpath="build/ghidra-decomp/ffxivlogin/x.c" if pseudo_c else None,
+            rtti_class=None,
+            rtti_vtable_rva_hex=None,
+            sibling_paths=list(siblings),
+            has_named_sibling=has_named,
+            blocked_post_mortem_path=("decomp-notes/blocked/x.md" if blocked else None),
+        )
+
+    # Easy: small + named sibling + Ghidra pseudo-C → triage.
+    fn = make_fn(TRIAGE_MAX_SIZE)
+    ctx = make_ctx(
+        size=TRIAGE_MAX_SIZE,
+        siblings=["src/ffxivlogin/_rosetta/Blowfish__Init.cpp"],
+        has_named=True,
+        pseudo_c=True,
+    )
+    assert classify_tier(fn, ctx) == "triage"
+
+    # Just-over-triage size → default (still has context, just bigger).
+    fn = make_fn(TRIAGE_MAX_SIZE + 1)
+    ctx = make_ctx(
+        size=TRIAGE_MAX_SIZE + 1,
+        siblings=["src/ffxivlogin/_rosetta/Blowfish__Init.cpp"],
+        has_named=True,
+        pseudo_c=True,
+    )
+    assert classify_tier(fn, ctx) == "default"
+
+    # Big body → escalation.
+    fn = make_fn(ESCALATION_MIN_SIZE + 1)
+    ctx = make_ctx(size=ESCALATION_MIN_SIZE + 1, pseudo_c=True)
+    assert classify_tier(fn, ctx) == "escalation"
+
+    # No siblings AND no pseudo-C → escalation regardless of size.
+    fn = make_fn(0x40)
+    ctx = make_ctx(size=0x40)
+    assert classify_tier(fn, ctx) == "escalation"
+
+    # Prior bail on disk → escalation, even if otherwise easy.
+    fn = make_fn(TRIAGE_MAX_SIZE)
+    ctx = make_ctx(
+        size=TRIAGE_MAX_SIZE,
+        siblings=["src/ffxivlogin/_rosetta/Blowfish__Init.cpp"],
+        has_named=True,
+        pseudo_c=True,
+        blocked=True,
+    )
+    assert classify_tier(fn, ctx) == "escalation"
+
+    # Only FUN_-prefixed sibling (auto-passthrough) → no named-sibling
+    # signal, so even an otherwise-easy fn falls to default.
+    fn = make_fn(TRIAGE_MAX_SIZE)
+    ctx = make_ctx(
+        size=TRIAGE_MAX_SIZE,
+        siblings=["src/ffxivlogin/_rosetta/FUN_004288ae.cpp"],
+        has_named=False,
+        pseudo_c=True,
+    )
+    assert classify_tier(fn, ctx) == "default"
 
 
 def test_diff_compatible_regex():

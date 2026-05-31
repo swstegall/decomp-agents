@@ -129,11 +129,10 @@ unless strictly needed, no README updates.
 
 You can grep these for FFXIV 1.x context but never edit them:
 
-- `../CLAUDE.md` — workspace overview, every dump's location + how to refresh
-- `/Users/swstegall/.claude/projects/-Users-swstegall-Documents-Programming-server-workspace/ffxiv_classic_wiki_context.md`
-- `/Users/swstegall/.claude/projects/-Users-swstegall-Documents-Programming-server-workspace/ffxiv_mozk_tabetai_context.md`
-- `/Users/swstegall/.claude/projects/-Users-swstegall-Documents-Programming-server-workspace/ffxiv_1x_battle_commands_context.md`
-- `/Users/swstegall/.claude/projects/-Users-swstegall-Documents-Programming-server-workspace/project_meteor_discord_context.md`
+- `../CLAUDE.md` — workspace overview, every dump's on-disk location + how to refresh
+- the FFXIV 1.x context dumps it lists — e.g. `ffxiv_classic_wiki_context.md`,
+  `ffxiv_mozk_tabetai_context.md`, `ffxiv_1x_battle_commands_context.md`,
+  `project_meteor_discord_context.md` (see `../CLAUDE.md` for their paths on your machine)
 
 These are most useful when you need to name an enum, identify what a
 magic number means in 1.x terms, or cross-reference a class to its
