@@ -88,6 +88,34 @@ class Config:
     # 100 % of work; this picks up the strays so the queue actually
     # drains.
     cross_session_merge: bool
+    # --- distributed mode (issue #11, D5) --------------------------------
+    # "local" (default) is the original N-worktree + SQLite-queue + local
+    # merge-loop topology. "distributed" switches to the fork-based
+    # GitHub-native flow: provision a fork of meteor-decomp, claim VAs via
+    # the upstream `claims` branch (driven by an issue-comment `/claim`),
+    # run the SAME per-function match loop + GREEN gate in the fork, then
+    # open a PR upstream. Backward-compatible: nothing below is read in
+    # local mode.
+    mode: str  # "local" | "distributed"
+    # The canonical upstream repo (owner/repo) the agent contributes to.
+    upstream: str
+    # The contributor's FORK of the upstream: either "owner/repo" or a
+    # full clone URL. Empty => `gh repo fork` will create/derive one under
+    # the agent's own gh identity.
+    fork: str
+    # The coordination ISSUE number on the upstream whose comments fire
+    # claim.yml. The agent posts `/claim FUN_<va> <binary>` there.
+    claim_issue: int
+    # The branch on upstream that PRs target (D1 ledger model uses
+    # `develop`). Also the branch the fork tracks for the solved set.
+    upstream_branch: str
+    # Where the fork working clone is checked out for distributed mode.
+    fork_root: Path
+    # Bounded poll for a claim win against the upstream `claims` branch:
+    # how long to wait, and the per-poll sleep (seconds). The upstream
+    # claim.yml CAS takes a few seconds to land the ledger commit.
+    claim_poll_timeout_s: int
+    claim_poll_interval_s: int
 
     @property
     def yaml_path(self) -> Path:
@@ -251,6 +279,51 @@ def load_config() -> Config:
     escalation_model_raw = os.environ.get("DECOMP_ESCALATION_MODEL", "opus").strip()
     escalation_model = _resolve_model(escalation_model_raw, env_name="DECOMP_ESCALATION_MODEL")
 
+    # --- distributed mode (issue #11, D5) --------------------------------
+    # Default is "local" so every existing invocation, test, and .env keeps
+    # the original N-worktree topology untouched. Distributed mode is opt-in.
+    mode = os.environ.get("DECOMP_MODE", "local").strip().lower()
+    if mode not in ("local", "distributed"):
+        raise RuntimeError(
+            f"DECOMP_MODE={mode!r} must be 'local' or 'distributed'"
+        )
+
+    # No baked-in default: this repo is public, so we never hardcode a
+    # personal GitHub handle. Distributed mode requires it explicitly (the
+    # `if not upstream` guard below fires); local mode never reads it.
+    upstream = os.environ.get("DECOMP_UPSTREAM", "").strip()
+    fork = os.environ.get("DECOMP_FORK", "").strip()
+    upstream_branch = os.environ.get("DECOMP_UPSTREAM_BRANCH", "develop").strip()
+
+    fork_root_env = os.environ.get("DECOMP_FORK_ROOT")
+    fork_root = (
+        Path(fork_root_env).resolve()
+        if fork_root_env
+        else (output_dir / "fork").resolve()
+    )
+
+    claim_issue_raw = os.environ.get("DECOMP_CLAIM_ISSUE", "").strip()
+    if mode == "distributed":
+        # These are only load-bearing in distributed mode; validate them
+        # there so local mode never trips on an unset coordination issue.
+        if not upstream:
+            raise RuntimeError(
+                "DECOMP_MODE=distributed requires DECOMP_UPSTREAM=<owner/repo>"
+            )
+        if not claim_issue_raw:
+            raise RuntimeError(
+                "DECOMP_MODE=distributed requires DECOMP_CLAIM_ISSUE=<issue number> "
+                "(the upstream coordination issue whose `/claim` comments fire claim.yml)"
+            )
+        try:
+            claim_issue = int(claim_issue_raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"DECOMP_CLAIM_ISSUE={claim_issue_raw!r} must be an integer issue number"
+            ) from exc
+    else:
+        claim_issue = int(claim_issue_raw) if claim_issue_raw.isdigit() else 0
+
     return Config(
         repo=repo,
         binary=binary,
@@ -272,4 +345,12 @@ def load_config() -> Config:
         escalation_model=escalation_model,
         post_merge_stamp=_bool_env("DECOMP_POST_MERGE_STAMP", True),
         cross_session_merge=_bool_env("DECOMP_CROSS_SESSION_MERGE", True),
+        mode=mode,
+        upstream=upstream,
+        fork=fork,
+        claim_issue=claim_issue,
+        upstream_branch=upstream_branch,
+        fork_root=fork_root,
+        claim_poll_timeout_s=_int_env("DECOMP_CLAIM_POLL_TIMEOUT_S", 180),
+        claim_poll_interval_s=_int_env("DECOMP_CLAIM_POLL_INTERVAL_S", 6),
     )
