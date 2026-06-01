@@ -139,6 +139,14 @@ decomp-agents
 | `DECOMP_WORKER_MODEL` | `opus` | `opus` / `sonnet` / `haiku` or a full `claude-...` model id. Opus is the strongest at codegen reasoning. |
 | `DECOMP_POST_MERGE_STAMP` | `1` | After each successful match-branch merge, run meteor-decomp's `stamp_clusters.py --reloc` + `validate_clusters.py` + `update_yaml_status.py` against the matched RVA's cluster (read from `build/easy_wins/<bin>.clusters_reloc.json`). Stamped + GREEN siblings are committed on top of the merge before the base ref is advanced. Singleton matches are a silent no-op. Requires that `make stamp-reloc` has been run at least once so the cluster JSON exists. Set to `0` to disable. |
 | `DECOMP_CROSS_SESSION_MERGE` | `1` | Drain pending merges from prior sessions in addition to the current one. Prior orchestrators sometimes exited before their final merge pass landed every match; this picks up the strays. Set to `0` to restrict the merge loop to the current session's claims only. |
+| `DECOMP_MODE` | `local` | `local` (everything above) or `distributed` (fork-based, GitHub-native — see [Distributed mode](#distributed-mode-issue-11)). The vars below are read only when `distributed`. |
+| `DECOMP_UPSTREAM` | _unset_ | Distributed: **required.** The canonical upstream repo (`owner/repo`, e.g. `owner/meteor-decomp`) the agent contributes PRs to. |
+| `DECOMP_FORK` | _unset_ | Distributed: the agent's fork (`owner/repo`). Unset → the agent creates/derives one under its own `gh` identity via `gh repo fork`. |
+| `DECOMP_CLAIM_ISSUE` | _unset_ | Distributed: **required.** Upstream coordination issue number whose comments fire `claim.yml`. The agent posts `/claim FUN_<va> <binary>` there. |
+| `DECOMP_UPSTREAM_BRANCH` | `develop` | Distributed: branch PRs target and the fork tracks for the solved set. |
+| `DECOMP_FORK_ROOT` | `./output/fork` | Distributed: where the fork working clone is checked out. |
+| `DECOMP_CLAIM_POLL_TIMEOUT_S` | `180` | Distributed: total seconds to poll the upstream `claims` branch for a claim win after posting `/claim`. |
+| `DECOMP_CLAIM_POLL_INTERVAL_S` | `6` | Distributed: per-poll sleep seconds. |
 
 ## Git topology — what actually moves to GitHub
 
@@ -169,11 +177,99 @@ The orchestrator runs an `ls-remote` sanity check at startup; if SSH
 auth is broken you'll see a warning before workers spawn rather than a
 flood of push failures mid-run.
 
+## Distributed mode (issue #11)
+
+Everything above describes **local mode** (the default): N worktrees of a
+single meteor-decomp checkout, a shared local SQLite claim queue, and a
+local merge loop. **Local mode is unchanged and remains the default** —
+if you don't set `DECOMP_MODE`, you get exactly the topology above.
+
+**Distributed mode** (`DECOMP_MODE=distributed`) instead runs one agent
+against a **fork** of meteor-decomp, coordinating with other contributors
+(human and automated) through meteor-decomp's GitHub-native claim system
+rather than a local SQLite queue. It reuses the exact same per-function
+match loop and GREEN grader — only the claim authority and the
+ship-the-work step differ.
+
+### Prerequisites
+
+- **`gh` authenticated as the agent's own identity.** Run `gh auth login`
+  first. Claims are attributed to *that* login — there is **no shared bot
+  token**, and every agent must authenticate as itself. (This is enforced
+  upstream: `claim.yml` binds the claim owner to the authenticated comment
+  author.)
+- A **coordination issue** open on the upstream repo whose comments fire
+  `claim.yml`, and the upstream claim workflows live (see meteor-decomp's
+  [`docs/claim-protocol.md` § Operating the claim system](../meteor-decomp/docs/claim-protocol.md)).
+  Put its number in `DECOMP_CLAIM_ISSUE`.
+- The meteor-decomp build toolchain (Wine + MSVC 2005) working, same as
+  local mode.
+
+### Configure
+
+```sh
+echo "DECOMP_MODE=distributed"          >> .env
+echo "DECOMP_UPSTREAM=owner/meteor-decomp" >> .env
+echo "DECOMP_CLAIM_ISSUE=123"           >> .env     # the coordination issue
+# Optional:
+# echo "DECOMP_FORK=your-login/meteor-decomp" >> .env  # else gh repo fork derives one
+# echo "DECOMP_UPSTREAM_BRANCH=develop"       >> .env  # PR target (default develop)
+# echo "DECOMP_FORK_ROOT=./output/fork"       >> .env  # fork working clone
+```
+
+### Flow: fork → claim → match → PR
+
+A distributed agent (`DistributedAgent` in
+`src/decomp_agents/distributed_orchestrator.py`) does, for one identity:
+
+1. **Provision a fork.** `gh repo fork` (or reuse `DECOMP_FORK`), clone it
+   to `DECOMP_FORK_ROOT`, add an `upstream` remote pointing at the
+   canonical repo.
+2. **Discover the free set.** Subtract three GitHub-side exclusion sets
+   from the binary's function pool: VAs already **solved** on the upstream
+   base tree (`src/<bin>/_rosetta/FUN_<va>.cpp` exists), VAs under a
+   **live claim** on the upstream `claims` branch, and VAs whose
+   `_rosetta` file is added by an **open PR**.
+3. **Claim** each candidate by posting `/claim FUN_<va> <binary>` on the
+   coordination issue, then polling the upstream `claims` branch (bounded
+   by `DECOMP_CLAIM_POLL_TIMEOUT_S`) until the ledger shows *your* login
+   owns it (`active`/`expiring`/`pinned-by-PR`). If another owner gets it
+   first, the agent moves on.
+4. **Match** on a per-function branch in the fork — the same
+   `run_match_loop` the local worker uses, with a fork/PR brief variant:
+   add exactly one `src/<bin>/_rosetta/FUN_<va>.cpp`, no YAML edit,
+   verified GREEN by `make rosetta` / `make diff`. The agent heartbeats
+   (re-posts `/claim`, an idempotent lease extend) before the long match
+   phase.
+5. **PR-gate** the branch locally (a toolchain-free check: exactly one
+   added `_rosetta` file with a valid AGPL/STAMPED header, not already
+   solved on the base ref). The base solved-set is read from the
+   **upstream base ref**, not the working tree, so the just-added file
+   doesn't self-collide as "already solved".
+6. **Open the upstream PR** (`decomp: match <Sym> @0x<rva>`,
+   fork → `DECOMP_UPSTREAM_BRANCH`). Opening the PR **pins** the claim
+   upstream; `reconcile.yml` **auto-releases** it on merge. On any
+   non-PR outcome (lost claim, blocked, gate fail) the agent
+   best-effort releases the claim.
+
+Parallelism in distributed mode is **N independent agent processes**, each
+its own fork / `gh` identity, serialised by the shared upstream claim
+ledger — *not* N worktrees of one repo (that's local mode). Run the
+orchestrator once per identity.
+
+```sh
+# after gh auth login + .env configured for distributed:
+python orchestrator.py            # routes to the distributed agent
+```
+
 ## Output layout
 
 ```
 output/
 ├── coordination.sqlite          # claim queue + tool-use log + merge log
+│                                 #   (local mode; distributed uses it only
+│                                 #    as a per-function context cache)
+├── fork/                         # distributed mode: the fork working clone
 ├── transcripts/agent-N.jsonl    # per-worker tool-use timeline
 ├── logs/agent-N.stdout.log      # raw worker stdout
 ├── logs/agent-N.stderr.log      # raw worker stderr

@@ -50,7 +50,7 @@ def _build_options(
     *,
     cwd: Path,
     system_prompt: str,
-    queue: WorkQueue,
+    queue: WorkQueue | None,
     worker_id: int,
     claim_id_ref: dict[str, int | None],
     transcripts_dir: Path,
@@ -61,15 +61,26 @@ def _build_options(
 
     Imported lazily so the worker module doesn't crash at import-time
     if the SDK isn't installed yet (helpful in tests + early setup).
+
+    ``queue`` may be ``None`` (distributed mode): the coordination-DB
+    tool-event hooks are simply omitted then, since distributed agents
+    don't share a SQLite ledger. The SDK options are otherwise identical
+    so the match loop is byte-for-byte the same in both modes.
     """
     from claude_agent_sdk import ClaudeAgentOptions, HookMatcher  # type: ignore
 
-    pretool = make_pretool_hook(
-        queue, worker_id, claim_id_ref, transcripts_dir, agent_id
-    )
-    posttool = make_posttool_hook(
-        queue, worker_id, claim_id_ref, pretool, transcripts_dir, agent_id
-    )
+    hooks = {}
+    if queue is not None:
+        pretool = make_pretool_hook(
+            queue, worker_id, claim_id_ref, transcripts_dir, agent_id
+        )
+        posttool = make_posttool_hook(
+            queue, worker_id, claim_id_ref, pretool, transcripts_dir, agent_id
+        )
+        hooks = {
+            "PreToolUse": [HookMatcher(matcher=".*", hooks=[pretool])],
+            "PostToolUse": [HookMatcher(matcher=".*", hooks=[posttool])],
+        }
 
     return ClaudeAgentOptions(
         cwd=str(cwd),
@@ -84,15 +95,34 @@ def _build_options(
         # size" and tears down the whole session. 16 MiB is enough for
         # every file in ffxivgame's asm/ tree.
         max_buffer_size=16 * 1024 * 1024,
-        hooks={
-            "PreToolUse": [HookMatcher(matcher=".*", hooks=[pretool])],
-            "PostToolUse": [HookMatcher(matcher=".*", hooks=[posttool])],
-        },
+        hooks=hooks,
     )
 
 
-def _function_brief(fn: Function, cfg: Config, ctx: PromptContext) -> str:
-    """The per-function task prompt fed to the agent for ONE function."""
+def _function_brief(
+    fn: Function, cfg: Config, ctx: PromptContext, *, distributed: bool = False
+) -> str:
+    """The per-function task prompt fed to the agent for ONE function.
+
+    ``distributed`` selects the fork/PR-topology loop variant. The two
+    differ ONLY in the write-target / build / commit-scope instructions:
+
+      - LOCAL: write ``src/<bin>/<module>/<symbol>.cpp``, build with
+        ``make src/.../<symbol>.obj``, update the row in
+        ``config/<bin>.yaml``, commit BOTH. (matches AGENTS.md's
+        local-agent contract.)
+      - DISTRIBUTED: write the single file ``src/<bin>/_rosetta/FUN_<va>.cpp``,
+        build with ``make rosetta BINARY=<bin>.exe`` (the only path that
+        produces the ``build/obj/_rosetta/<func>.obj`` that ``make diff``
+        reads), do NOT touch ``config/<bin>.yaml`` (the upstream claims
+        branch + reconcile.yml own status), and ``git add`` only that one
+        file. This is what the distributed PR-gate
+        (:func:`pr_gate.run_pr_gate`) enforces, so a brief-following agent
+        produces a branch that clears the gate.
+
+    The shared asm/sibling-reading steps (1, 2) and the diff-verdict /
+    canonical-fixes loop (5–8) are identical in both modes.
+    """
     max_iters = cfg.max_iterations_per_function
 
     head = f"""You are matching ONE function from {fn.binary}.exe.
@@ -111,7 +141,32 @@ def _function_brief(fn: Function, cfg: Config, ctx: PromptContext) -> str:
 
     body = ctx.to_markdown(max_iters=max_iters, fn=fn)
 
-    tail = f"""
+    tail = (
+        _distributed_loop(fn, max_iters)
+        if distributed
+        else _local_loop(fn, max_iters)
+    )
+
+    workspace = f"""
+## Workspace context (read-only)
+
+  - `{cfg.repo.parent}/CLAUDE.md` — workspace overview + every dump's
+    location and grep hints
+
+Stay in this worktree. The repo path is `{cfg.repo}`; your worktree
+is a checkout sharing the same .git. Never `cd` outside of it.
+
+You CANNOT open Ghidra (`*.gpr` files are a GUI artefact, not readable
+text). All your decompilation hints come from the asm dump and the
+optional headless pseudo-C above.
+"""
+
+    return head + body + tail + workspace
+
+
+def _local_loop(fn: Function, max_iters: int) -> str:
+    """The LOCAL-mode loop tail: module/symbol.cpp + YAML row + commit both."""
+    return f"""
 
 ## Your loop
 
@@ -150,21 +205,142 @@ a half-match. Revert any in-progress src/ edits with
 the post-mortem file described above, then emit a final text message
 containing the literal string `BLOCKED:` followed by a one-sentence
 reason. Then stop.
-
-## Workspace context (read-only)
-
-  - `{cfg.repo.parent}/CLAUDE.md` — workspace overview + every dump's
-    location and grep hints
-
-Stay in this worktree. The repo path is `{cfg.repo}`; your worktree
-is a checkout sharing the same .git. Never `cd` outside of it.
-
-You CANNOT open Ghidra (`*.gpr` files are a GUI artefact, not readable
-text). All your decompilation hints come from the asm dump and the
-optional headless pseudo-C above.
 """
 
-    return head + body + tail
+
+def _distributed_loop(fn: Function, max_iters: int) -> str:
+    """The DISTRIBUTED-mode loop tail: a single _rosetta/FUN_<va>.cpp.
+
+    The agent works from a FORK clone tracking the upstream base branch and
+    will open a PR upstream, so the output must satisfy the toolchain-free
+    PR-gate: EXACTLY ONE added file `src/<bin>/_rosetta/FUN_<va>.cpp`, no
+    YAML edit, verbatim AGPL header. The upstream `claims` branch +
+    reconcile.yml own the YAML status field — the PR must not carry it.
+    """
+    rosetta = f"src/{fn.binary}/_rosetta/{fn.symbol}.cpp"
+    return f"""
+
+## Your loop (distributed / fork-PR mode)
+
+You are preparing a PULL REQUEST to upstream. The PR must add EXACTLY
+ONE file and nothing else. Do NOT edit `config/{fn.binary}.yaml`,
+`tools/`, `Makefile`, `PLAN.md`, `README*`, `docs/`, `include/`, or any
+other coordination surface — the upstream claims branch and reconcile.yml
+own the YAML status; a PR that touches them will be rejected by the gate.
+
+  1. Read the asm. Identify calling convention (`__cdecl` / `__stdcall` /
+     `__thiscall` / `__fastcall`), stack frame size, return type, branch
+     shape. Don't proceed until you can name them.
+  2. If pseudo-C is available, read it as a hint. If not, look at the
+     sibling matches above and find the closest structural analog.
+  3. Write the SINGLE new file `{rosetta}` following the local idiom.
+     Copy the AGPL header verbatim from a sibling `_rosetta/*.cpp` — don't
+     reinvent it. (If the sibling you copy from opens with a `// [STAMPED]`
+     banner, you do NOT need that banner — start your file at the
+     `// meteor-decomp …` AGPL line.) Do NOT create a `<module>/`
+     subdirectory; the only legal path is the `_rosetta/FUN_<va>.cpp` one.
+  4. Compile + diff in one step: `make rosetta BINARY={fn.binary}.exe`.
+     This compiles every staged `src/{fn.binary}/_rosetta/*.cpp` into
+     `build/obj/_rosetta/{fn.binary}/<func>.obj` and runs `compare.py` —
+     the same GREEN grader. (Equivalently you can run
+     `make diff FUNC={fn.symbol}` once the obj exists.)
+  5. The diff prints `✅ GREEN` (exit 0) for byte-identical, `PARTIAL`
+     (exit 1) for same-length-but-wrong-bytes, or `MISMATCH` (exit 2)
+     for wholesale wrong. **Only GREEN is a match.**
+  6. If GREEN: continue to step 8.
+  7. If PARTIAL/MISMATCH: pick the most-likely cause from the canonical
+     fixes table (in `meteor-decomp/AGENTS.md` and
+     `docs/matching-workflow.md` §7) and try ONE adjustment. Recompile
+     + re-diff. Repeat up to {max_iters} times.
+  8. `git add` ONLY `{rosetta}` (nothing else — no YAML, no notes added to
+     shared files). Commit with:
+       decomp: match {fn.symbol} @{fn.rva_hex}
+       <one-line note on which fix worked>
+  9. STOP. Do not pick another function — the orchestrator will hand
+     you the next one (and run the PR-gate + open the PR).
+
+## On bail
+
+If you can't reach GREEN within {max_iters} iterations, do NOT commit
+a half-match. Revert any in-progress src/ edits with
+`git checkout -- src/{fn.binary}/` (and `git reset` any staged file),
+then emit a final text message containing the literal string `BLOCKED:`
+followed by a one-sentence reason. Then stop.
+"""
+
+
+async def run_match_loop(
+    *,
+    cfg: Config,
+    fn: Function,
+    cwd: Path,
+    model: str,
+    ctx: PromptContext,
+    queue: WorkQueue | None = None,
+    worker_id: int = -1,
+    agent_id: int = -1,
+    claim_id_ref: dict[str, int | None] | None = None,
+    transcripts_dir: Path | None = None,
+    on_iteration=None,
+    distributed: bool = False,
+) -> tuple[str, int]:
+    """Drive the Claude Agent SDK match loop for ONE function.
+
+    This is the shared loop body used by BOTH local mode
+    (:func:`_run_function`) and distributed mode
+    (distributed_orchestrator). It builds the per-function brief, runs the
+    SDK ``query`` stream, counts iterations, detects the ``BLOCKED:`` bail,
+    and grades the outcome via :func:`_grade_outcome` (the single GREEN
+    grader — never duplicated).
+
+    ``queue`` is optional: when ``None`` (distributed mode) the
+    coordination-DB tool-event hooks + iteration writes are skipped, but
+    the loop is otherwise identical. ``on_iteration(i)`` is an optional
+    callback fired after each counted tool-result so a caller can persist
+    the iteration count its own way.
+
+    ``distributed`` selects the fork/PR-topology brief variant: the agent
+    writes a single ``src/<bin>/_rosetta/FUN_<va>.cpp`` (the path the
+    PR-gate + Makefile `rosetta` target expect) and does NOT touch the
+    YAML. Defaults to False so local mode is byte-for-byte unchanged.
+
+    Returns ``(outcome, iterations)`` where ``outcome`` is "matched" iff
+    ``make diff`` came back GREEN, else "blocked".
+    """
+    from claude_agent_sdk import query  # type: ignore
+
+    system_prompt = load_worker_system_prompt()
+    options = _build_options(
+        cwd=cwd,
+        system_prompt=system_prompt,
+        queue=queue,
+        worker_id=worker_id,
+        claim_id_ref=claim_id_ref if claim_id_ref is not None else {"current": None},
+        transcripts_dir=transcripts_dir or cfg.transcripts_dir,
+        agent_id=agent_id,
+        model=model,
+    )
+    user_prompt = _function_brief(fn, cfg, ctx, distributed=distributed).replace(
+        "{max_iters}", str(cfg.max_iterations_per_function)
+    )
+
+    iterations = 0
+    bailed = False
+    async for message in query(prompt=user_prompt, options=options):
+        msg_type = getattr(message, "type", None) or message.__class__.__name__
+        # The SDK doesn't expose a per-turn counter directly; we
+        # approximate by counting tool-result messages.
+        if msg_type.endswith("ToolResult") or msg_type.endswith("ToolResultMessage"):
+            iterations += 1
+            if on_iteration is not None:
+                on_iteration(iterations)
+        # Bail if the agent printed BLOCKED.
+        text = getattr(message, "text", "") or ""
+        if isinstance(text, str) and "BLOCKED:" in text.upper():
+            bailed = True
+
+    outcome = _grade_outcome(cwd, fn, bailed=bailed)
+    return outcome, iterations
 
 
 async def _run_function(
@@ -179,8 +355,6 @@ async def _run_function(
     transcripts_dir: Path,
 ) -> tuple[str, int]:
     """Drive the SDK loop for one function. Returns (outcome, iterations)."""
-    from claude_agent_sdk import query  # type: ignore
-
     # Build context once and use it for both the brief and the model
     # tier choice — building it touches a handful of YAML/JSON/disk
     # reads we don't want to repeat.
@@ -197,45 +371,30 @@ async def _run_function(
         }
     )
 
-    system_prompt = load_worker_system_prompt()
-    options = _build_options(
-        cwd=cwd,
-        system_prompt=system_prompt,
-        queue=queue,
-        worker_id=worker_id,
-        claim_id_ref=claim_id_ref,
-        transcripts_dir=transcripts_dir,
-        agent_id=agent_id,
-        model=model,
-    )
-    user_prompt = _function_brief(claim.function, cfg, ctx).replace(
-        "{max_iters}", str(cfg.max_iterations_per_function)
-    )
-
-    iterations = 0
-    bailed = False
-    async for message in query(prompt=user_prompt, options=options):
-        msg_type = getattr(message, "type", None) or message.__class__.__name__
+    def _persist(i: int) -> None:
+        queue.update_iterations(claim.id, i)
         _emit(
             {
                 "kind": "sdk_event",
                 "agent_id": agent_id,
                 "claim_id": claim.id,
-                "msg_type": msg_type,
+                "msg_type": "ToolResult",
             }
         )
-        # The SDK doesn't expose a per-turn counter directly; we
-        # approximate by counting tool-result messages.
-        if msg_type.endswith("ToolResult") or msg_type.endswith("ToolResultMessage"):
-            iterations += 1
-            queue.update_iterations(claim.id, iterations)
-        # Bail if the agent printed BLOCKED.
-        text = getattr(message, "text", "") or ""
-        if isinstance(text, str) and "BLOCKED:" in text.upper():
-            bailed = True
 
-    outcome = _grade_outcome(cwd, claim.function, bailed=bailed)
-    return outcome, iterations
+    return await run_match_loop(
+        cfg=cfg,
+        fn=claim.function,
+        cwd=cwd,
+        model=model,
+        ctx=ctx,
+        queue=queue,
+        worker_id=worker_id,
+        agent_id=agent_id,
+        claim_id_ref=claim_id_ref,
+        transcripts_dir=transcripts_dir,
+        on_iteration=_persist,
+    )
 
 
 def _grade_outcome(cwd: Path, fn: Function, *, bailed: bool) -> str:

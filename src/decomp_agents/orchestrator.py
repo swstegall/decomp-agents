@@ -451,6 +451,26 @@ def main(dry_run: bool) -> None:
         stream=sys.stderr,
     )
     cfg = load_config()
+
+    # Mode switch (issue #11, D5). LOCAL mode (default) keeps the original
+    # N-worktree + SQLite-queue + merge-loop topology below. DISTRIBUTED
+    # mode hands off to the fork-based GitHub-native agent. The local path
+    # is entirely unchanged.
+    if cfg.mode == "distributed":
+        from .distributed_orchestrator import run_distributed
+
+        if dry_run:
+            click.echo("dry-run (distributed):")
+            click.echo(f"  upstream      = {cfg.upstream}")
+            click.echo(f"  fork          = {cfg.fork or '(gh repo fork)'}")
+            click.echo(f"  claim_issue   = {cfg.claim_issue}")
+            click.echo(f"  upstream_branch = {cfg.upstream_branch}")
+            click.echo(f"  fork_root     = {cfg.fork_root}")
+            click.echo(f"  binary        = {cfg.binary}")
+            return
+        rc = asyncio.run(run_distributed(cfg))
+        sys.exit(rc)
+
     orch = Orchestrator(cfg)
 
     if dry_run:

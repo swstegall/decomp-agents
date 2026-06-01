@@ -158,10 +158,10 @@ def test_worker_model_aliases(monkeypatch, tmp_path):
     assert config.load_config().worker_model.startswith("claude-haiku-")
 
     monkeypatch.setenv("DECOMP_WORKER_MODEL", "opus")
-    assert config.load_config().worker_model == "claude-opus-4-7"
+    assert config.load_config().worker_model == "claude-opus-4-8"
 
-    monkeypatch.setenv("DECOMP_WORKER_MODEL", "claude-opus-4-7-something")
-    assert config.load_config().worker_model == "claude-opus-4-7-something"
+    monkeypatch.setenv("DECOMP_WORKER_MODEL", "claude-opus-4-8-something")
+    assert config.load_config().worker_model == "claude-opus-4-8-something"
 
     monkeypatch.setenv("DECOMP_WORKER_MODEL", "bogus")
     with pytest.raises(RuntimeError, match="DECOMP_WORKER_MODEL"):
@@ -182,14 +182,14 @@ def test_tier_model_aliases_and_defaults(monkeypatch, tmp_path):
     cfg = config.load_config()
     assert cfg.triage_model.startswith("claude-haiku-")
     assert cfg.worker_model == "claude-sonnet-4-6"
-    assert cfg.escalation_model == "claude-opus-4-7"
+    assert cfg.escalation_model == "claude-opus-4-8"
 
     # Per-tier env vars resolve aliases independently.
     monkeypatch.setenv("DECOMP_TRIAGE_MODEL", "sonnet")
-    monkeypatch.setenv("DECOMP_ESCALATION_MODEL", "claude-opus-4-7-edge")
+    monkeypatch.setenv("DECOMP_ESCALATION_MODEL", "claude-opus-4-8-edge")
     cfg = config.load_config()
     assert cfg.triage_model == "claude-sonnet-4-6"
-    assert cfg.escalation_model == "claude-opus-4-7-edge"
+    assert cfg.escalation_model == "claude-opus-4-8-edge"
 
     # model_for_tier dispatch.
     assert cfg.model_for_tier("triage") == cfg.triage_model
