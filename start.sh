@@ -59,6 +59,16 @@ if [[ -f "$SCRIPT_DIR/.env" ]]; then
   set +a
 fi
 
+# 4.5. Keep meteor-decomp's develop current before handing off. Safe ff-only:
+#       the script no-ops on a dirty tree or local-ahead commits, so it can
+#       never clobber work — it just avoids starting a run on a stale develop.
+#       DECOMP_REPO (from .env) points at the checkout the workers build from.
+SYNC_REPO="${DECOMP_REPO:-../meteor-decomp}"
+if [[ -x "$SYNC_REPO/tools/sync-develop.sh" ]]; then
+  echo "[start.sh] syncing $SYNC_REPO develop (ff-only)"
+  "$SYNC_REPO/tools/sync-develop.sh" || true
+fi
+
 # 5. Hand off to the orchestrator. Use the console script so the venv's
 #    entry point is what actually runs.
 exec decomp-agents "$@"
