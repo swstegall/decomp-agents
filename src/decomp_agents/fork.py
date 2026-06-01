@@ -63,6 +63,26 @@ def _git(clone: Path, *args: str, check: bool = True) -> subprocess.CompletedPro
     return _run(["git", "-C", str(clone), *args], check=check)
 
 
+def _ensure_git_push_auth() -> None:
+    """Make `git push` authenticate via the agent's gh login.
+
+    A fork clone (whether from `gh repo fork --clone` or `git clone owner/repo`)
+    gets an HTTPS `origin`, and modern GitHub rejects HTTPS password auth
+    ("Password authentication is not supported for Git operations"), so the
+    branch push that precedes `gh pr create` fails. `gh auth setup-git`
+    registers gh as the git credential helper for github.com so HTTPS pushes use
+    the gh token. Idempotent + best-effort: on failure (e.g. gh too old) warn
+    and continue — an SSH `origin` or a pre-existing credential helper still works.
+    """
+    r = _run(["gh", "auth", "setup-git"], check=False)
+    if r.returncode != 0:
+        log.warning(
+            "`gh auth setup-git` failed (%s); `git push` may prompt for "
+            "credentials — configure SSH keys or a gh credential helper",
+            (r.stderr or r.stdout).strip()[:140],
+        )
+
+
 def gh_login() -> str:
     """The agent's own authenticated GitHub login (its identity).
 
@@ -135,6 +155,7 @@ def provision_fork(
     target = target.resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     login = agent_login or gh_login()
+    _ensure_git_push_auth()
 
     if (target / ".git").exists():
         log.info("fork clone already present at %s — reusing", target)
