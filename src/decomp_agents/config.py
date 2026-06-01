@@ -17,9 +17,9 @@ SUPPORTED_BINARIES = (
 
 # Map convenience aliases to current model ids. Update when a new
 # Claude family ships. Users can also pass a full model id verbatim
-# (e.g. "claude-opus-4-7") and it'll be passed through unchanged.
+# (e.g. "claude-opus-4-8") and it'll be passed through unchanged.
 WORKER_MODEL_ALIASES = {
-    "opus": "claude-opus-4-7",
+    "opus": "claude-opus-4-8",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }
