@@ -69,6 +69,14 @@ if [[ -x "$SYNC_REPO/tools/sync-develop.sh" ]]; then
   "$SYNC_REPO/tools/sync-develop.sh" || true
 fi
 
+# 4.6. Push any GREEN matches a prior local-mode run stranded on develop (the
+#       orchestrator isn't running yet, so the script's active-run guard lets
+#       this through). Pushes nothing unless every ahead commit re-grades GREEN.
+if [[ -x "$SYNC_REPO/tools/push-matches.sh" ]]; then
+  echo "[start.sh] pushing any stranded GREEN matches on $SYNC_REPO develop"
+  "$SYNC_REPO/tools/push-matches.sh" || true
+fi
+
 # 5. Hand off to the orchestrator. Use the console script so the venv's
 #    entry point is what actually runs.
 exec decomp-agents "$@"
