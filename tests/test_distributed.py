@@ -607,6 +607,59 @@ def test_function_branch_name():
     assert function_branch_name(0x1230, "Blowfish::Init") == "agents/0x00001230_Blowfish__Init"
 
 
+def test_start_function_branch_clears_stale_untracked_rosetta(tmp_path):
+    """Regression: a leftover untracked _rosetta file must not abort the checkout.
+
+    A prior attempt (a "blocked" function, or an error mid-loop) can leave an
+    untracked `src/<bin>/_rosetta/FUN_<va>.cpp` in the tree. Once
+    `upstream/develop` is refreshed and TRACKS that same file (it was solved
+    upstream meanwhile), `git checkout -B` would abort with "untracked working
+    tree files would be overwritten". start_function_branch must pristine the
+    tree first so the next function still starts cleanly.
+    """
+    from decomp_agents.fork import ForkClone, start_function_branch
+
+    binary = "ffxivgame"
+    repo = tmp_path / "fork"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "agent@example.com")
+    _git(repo, "config", "user.name", "agent")
+    # Base commit on `main` (no _rosetta yet).
+    (repo / "README").write_text("base\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    # `upstream/develop` TRACKS FUN_00410a00.cpp (solved upstream meanwhile).
+    _git(repo, "checkout", "-q", "-b", "upstream/develop")
+    ros = repo / "src" / binary / "_rosetta"
+    ros.mkdir(parents=True)
+    (ros / "FUN_00410a00.cpp").write_text("// upstream-tracked\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "solve FUN_00410a00")
+    # Back on main (which does NOT track the file), drop the stale untracked
+    # copy a prior agent attempt would have left in the working tree.
+    _git(repo, "checkout", "-q", "main")
+    (repo / "src" / binary / "_rosetta").mkdir(parents=True)
+    (repo / "src" / binary / "_rosetta" / "FUN_00410a00.cpp").write_text("// stale local\n")
+
+    clone = ForkClone(
+        path=repo,
+        upstream="owner/repo",
+        fork_owner="agent",
+        upstream_branch="develop",
+    )
+
+    # Pre-fix this raised ForkError("untracked working tree files would be
+    # overwritten"); post-fix it cuts the branch cleanly.
+    branch = start_function_branch(clone, rva=0x10BE0, symbol="FUN_00410be0")
+    assert branch == "agents/0x00010be0_FUN_00410be0"
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == branch
+    # The branch now carries upstream's tracked version, not the stale local one.
+    assert (repo / "src" / binary / "_rosetta" / "FUN_00410a00.cpp").read_text() == (
+        "// upstream-tracked\n"
+    )
+
+
 # ---------------------------------------------------------------------------
 # worker brief: distributed vs local variant
 # ---------------------------------------------------------------------------

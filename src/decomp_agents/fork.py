@@ -221,6 +221,17 @@ def start_function_branch(
     # Make sure the base ref exists locally; a fresh clone may not have
     # fetched it yet under this exact name.
     _git(clone.path, "fetch", "upstream", clone.upstream_branch, check=False)
+    # Pristine the tree before snapping to the base. A prior attempt (a
+    # "blocked" function, an error mid-loop) can leave untracked generated
+    # `src/<bin>/_rosetta/FUN_<va>.cpp` files behind. Once upstream/<branch>
+    # is refreshed and TRACKS one of those same files (because it was solved
+    # upstream meanwhile), `checkout -B` aborts with "untracked working tree
+    # files would be overwritten". `reset --hard` clears tracked edits;
+    # `clean -fd` (note: NO `-x`) removes the stale untracked work products
+    # while leaving the gitignored orig/ + *.symbols.json artifact symlinks
+    # untouched, so grading still works without re-provisioning.
+    _git(clone.path, "reset", "--hard", check=False)
+    _git(clone.path, "clean", "-fd", check=False)
     _git(clone.path, "checkout", "-B", branch, base)
     log.info("started function branch %s off %s", branch, base)
     return branch
