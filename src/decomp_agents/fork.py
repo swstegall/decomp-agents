@@ -23,6 +23,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .config import SUPPORTED_BINARIES
+
 log = logging.getLogger(__name__)
 
 
@@ -213,3 +215,183 @@ def push_function_branch(clone: ForkClone, branch: str) -> tuple[bool, str]:
     if r.returncode == 0:
         return True, r.stdout.strip()
     return False, (r.stderr or r.stdout).strip()
+
+
+# ---------------------------------------------------------------------------
+# toolchain-artifact provisioning (distributed mode GREEN grader)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ArtifactLink:
+    """One provisioned (or attempted) artifact symlink."""
+
+    kind: str          # "orig" | "symbols"
+    binary: str        # binary stem, e.g. "ffxivgame"
+    src: Path          # source under <artifacts_dir>
+    dst: Path          # symlink target inside the clone
+    ok: bool           # True iff the symlink now points at an existing source
+    reason: str        # human-readable detail (esp. on failure)
+
+
+@dataclass(frozen=True)
+class ArtifactProvisionResult:
+    """Outcome of :func:`provision_toolchain_artifacts`.
+
+    ``ok`` is True iff the *configured* binary's BOTH artifacts (orig +
+    symbols) are now present in the clone — i.e. `make diff` can grade.
+    Other binaries' artifacts are best-effort extras and never gate ``ok``.
+    """
+
+    ok: bool
+    links: list[ArtifactLink]
+    warning: str | None  # set (and logged) when grading will fail
+
+
+def _symlink_force(src: Path, dst: Path) -> None:
+    """Create/refresh a symlink dst -> src. Idempotent.
+
+    Removes any stale entry first (broken symlink, old symlink to a
+    different source, or a plain file) so reruns converge. We deliberately
+    do NOT copy: the source is copyrighted SE-derived material that must
+    never land inside a tracked tree. A symlink under the clone's
+    gitignored `orig/` / `config/*.symbols.json` paths can never be staged.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # `exists()` follows symlinks (False for a broken link); `is_symlink()`
+    # catches the broken/stale-symlink case so we still replace it.
+    if dst.is_symlink() or dst.exists():
+        dst.unlink()
+    dst.symlink_to(src)
+
+
+def provision_toolchain_artifacts(
+    clone_path: Path,
+    artifacts_dir: Path | None,
+    binary: str,
+) -> ArtifactProvisionResult:
+    """Symlink the user's copyright-derived toolchain artifacts into a clone.
+
+    Distributed mode works from a fresh clone of the fork. `make diff` (the
+    GREEN grader) needs two files that are gitignored in EVERY meteor-decomp
+    clone — and therefore absent from a fresh one:
+
+      - ``orig/<binary>.exe``            (the SE game binary)
+      - ``config/<binary>.symbols.json`` (the Ghidra dump derived from it)
+
+    We never ship, copy, or commit these (we cannot distribute copyrighted
+    material). Instead the user points ``DECOMP_ARTIFACTS_DIR`` at a local
+    meteor-decomp checkout that already holds their OWN copies, and we
+    SYMLINK them into the clone. Because the clone's `.gitignore` already
+    ignores ``orig/*`` and ``config/*.symbols.json``, those symlinks are
+    gitignored and can never be staged / committed / pushed in the agent's
+    PR — copyrighted bytes cannot leak.
+
+    Symlinks ALL five binaries' artifacts when present (cheap, and lets one
+    provisioning cover a multi-binary session), but only the *configured*
+    ``binary``'s pair gates the returned ``ok``.
+
+    Idempotent: stale symlinks are replaced. Degrades gracefully — if
+    ``artifacts_dir`` is None or a source file is missing, it logs a clear
+    WARNING that `make diff` grading will fail until the user sets
+    ``DECOMP_ARTIFACTS_DIR`` to their own orig/symbols, and returns
+    ``ok=False`` WITHOUT raising (claiming + free-set still work; only
+    grading needs the artifacts).
+    """
+    clone_path = clone_path.resolve()
+    links: list[ArtifactLink] = []
+
+    if artifacts_dir is None:
+        warning = (
+            "no toolchain-artifact source configured (DECOMP_ARTIFACTS_DIR "
+            "unset and DECOMP_REPO has no orig/) — `make diff` grading will "
+            "FAIL in distributed mode until you point DECOMP_ARTIFACTS_DIR "
+            "at a local meteor-decomp checkout holding your OWN "
+            f"orig/{binary}.exe + config/{binary}.symbols.json (these "
+            "copyrighted SE-derived files are never distributed). Claiming "
+            "and free-set discovery still work; only grading needs them."
+        )
+        log.warning("%s", warning)
+        return ArtifactProvisionResult(ok=False, links=links, warning=warning)
+
+    artifacts_dir = artifacts_dir.resolve()
+
+    # Provision all five binaries' pairs where the source exists; the
+    # configured binary's pair is the one that gates `ok`.
+    ordered = [binary] + [b for b in SUPPORTED_BINARIES if b != binary]
+    for stem in ordered:
+        for kind, src, dst in (
+            (
+                "orig",
+                artifacts_dir / "orig" / f"{stem}.exe",
+                clone_path / "orig" / f"{stem}.exe",
+            ),
+            (
+                "symbols",
+                artifacts_dir / "config" / f"{stem}.symbols.json",
+                clone_path / "config" / f"{stem}.symbols.json",
+            ),
+        ):
+            if not src.exists():
+                # Only the CONFIGURED binary's missing artifacts are
+                # noteworthy; other binaries are optional extras.
+                if stem == binary:
+                    links.append(
+                        ArtifactLink(
+                            kind=kind,
+                            binary=stem,
+                            src=src,
+                            dst=dst,
+                            ok=False,
+                            reason=f"source missing: {src}",
+                        )
+                    )
+                continue
+            try:
+                _symlink_force(src, dst)
+                links.append(
+                    ArtifactLink(
+                        kind=kind,
+                        binary=stem,
+                        src=src,
+                        dst=dst,
+                        ok=True,
+                        reason=f"symlinked {dst} -> {src}",
+                    )
+                )
+                log.info("provisioned %s artifact: %s -> %s", stem, dst, src)
+            except OSError as exc:
+                links.append(
+                    ArtifactLink(
+                        kind=kind,
+                        binary=stem,
+                        src=src,
+                        dst=dst,
+                        ok=False,
+                        reason=f"symlink failed: {exc}",
+                    )
+                )
+                log.warning("failed to symlink %s -> %s: %s", dst, src, exc)
+
+    # Grading needs BOTH artifacts for the configured binary.
+    cfg_links = [ln for ln in links if ln.binary == binary]
+    have_orig = any(ln.kind == "orig" and ln.ok for ln in cfg_links)
+    have_symbols = any(ln.kind == "symbols" and ln.ok for ln in cfg_links)
+    ok = have_orig and have_symbols
+
+    warning: str | None = None
+    if not ok:
+        missing = []
+        if not have_orig:
+            missing.append(f"orig/{binary}.exe")
+        if not have_symbols:
+            missing.append(f"config/{binary}.symbols.json")
+        warning = (
+            f"could not provision {', '.join(missing)} from {artifacts_dir} "
+            f"— `make diff` grading will FAIL until your DECOMP_ARTIFACTS_DIR "
+            f"checkout holds these (run `make split BINARY={binary}.exe` there "
+            "if needed). Claiming + free-set still work; only grading needs them."
+        )
+        log.warning("%s", warning)
+
+    return ArtifactProvisionResult(ok=ok, links=links, warning=warning)

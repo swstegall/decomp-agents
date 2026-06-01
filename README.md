@@ -145,6 +145,7 @@ decomp-agents
 | `DECOMP_CLAIM_ISSUE` | _unset_ | Distributed: **required.** Upstream coordination issue number whose comments fire `claim.yml`. The agent posts `/claim FUN_<va> <binary>` there. |
 | `DECOMP_UPSTREAM_BRANCH` | `develop` | Distributed: branch PRs target and the fork tracks for the solved set. |
 | `DECOMP_FORK_ROOT` | `./output/fork` | Distributed: where the fork working clone is checked out. |
+| `DECOMP_ARTIFACTS_DIR` | `DECOMP_REPO` if it has an `orig/` dir, else _unset_ | Distributed: a **local** meteor-decomp checkout that holds your **own** `orig/<bin>.exe` + `config/<bin>.symbols.json` (the copyright-derived files `make diff` needs). Distributed mode **symlinks** them into the fork clone; they are never copied or committed. Unset + no `orig/` under `DECOMP_REPO` ⇒ grading is disabled with a warning. See [Prerequisites — bring your own SE binary](#prerequisites). |
 | `DECOMP_CLAIM_POLL_TIMEOUT_S` | `180` | Distributed: total seconds to poll the upstream `claims` branch for a claim win after posting `/claim`. |
 | `DECOMP_CLAIM_POLL_INTERVAL_S` | `6` | Distributed: per-poll sleep seconds. |
 
@@ -203,7 +204,26 @@ ship-the-work step differ.
   [`docs/claim-protocol.md` § Operating the claim system](../meteor-decomp/docs/claim-protocol.md)).
   Put its number in `DECOMP_CLAIM_ISSUE`.
 - The meteor-decomp build toolchain (Wine + MSVC 2005) working, same as
-  local mode.
+  local mode — the committed `tools/cl-wine.sh` wrapper points at your
+  global MSVC-2005-under-Wine install, so the toolchain itself is **not**
+  provisioned per clone.
+- **Bring your own SE binary (copyright).** The PR-gate's GREEN check runs
+  `make diff`, which needs two files that are **gitignored in every
+  meteor-decomp clone** (so a fresh fork clone never has them):
+  `orig/<bin>.exe` (the Square Enix game binary) and
+  `config/<bin>.symbols.json` (the Ghidra dump derived from it). These are
+  copyrighted SE-derived material and are **never distributed, copied into
+  git, or committed** — distributed mode cannot ship them. You must have
+  your **own** local copy: a meteor-decomp checkout with `orig/<bin>.exe`
+  present, plus `config/<bin>.symbols.json` (run `make split BINARY=<bin>.exe`
+  there once if it's missing). Point `DECOMP_ARTIFACTS_DIR` at that checkout;
+  the agent **symlinks** the two files into the fork clone after cloning.
+  Because the clone's `.gitignore` already ignores `orig/*` and
+  `config/*.symbols.json`, those symlinks can never be staged or land in
+  your PR diff. `DECOMP_ARTIFACTS_DIR` defaults to `DECOMP_REPO` when unset
+  (the common case where your local-mode checkout already holds the
+  artifacts); if neither is available the run still claims + matches but
+  grading is disabled with a clear warning until you set it.
 
 ### Configure
 
@@ -215,6 +235,8 @@ echo "DECOMP_CLAIM_ISSUE=123"           >> .env     # the coordination issue
 # echo "DECOMP_FORK=your-login/meteor-decomp" >> .env  # else gh repo fork derives one
 # echo "DECOMP_UPSTREAM_BRANCH=develop"       >> .env  # PR target (default develop)
 # echo "DECOMP_FORK_ROOT=./output/fork"       >> .env  # fork working clone
+# echo "DECOMP_ARTIFACTS_DIR=../meteor-decomp" >> .env # your own orig/ + symbols.json
+#                                                      # (defaults to DECOMP_REPO; never shipped)
 ```
 
 ### Flow: fork → claim → match → PR
@@ -224,7 +246,11 @@ A distributed agent (`DistributedAgent` in
 
 1. **Provision a fork.** `gh repo fork` (or reuse `DECOMP_FORK`), clone it
    to `DECOMP_FORK_ROOT`, add an `upstream` remote pointing at the
-   canonical repo.
+   canonical repo. Then **symlink the toolchain artifacts** from
+   `DECOMP_ARTIFACTS_DIR` — `orig/<bin>.exe` + `config/<bin>.symbols.json`
+   — into the clone so `make diff` can grade. (Gitignored in the clone, so
+   never committed; a missing source only disables grading, with a
+   warning.)
 2. **Discover the free set.** Subtract three GitHub-side exclusion sets
    from the binary's function pool: VAs already **solved** on the upstream
    base tree (`src/<bin>/_rosetta/FUN_<va>.cpp` exists), VAs under a

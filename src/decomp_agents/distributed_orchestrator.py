@@ -35,6 +35,7 @@ from .fork import (
     ForkClone,
     gh_login,
     provision_fork,
+    provision_toolchain_artifacts,
     push_function_branch,
     start_function_branch,
 )
@@ -83,6 +84,22 @@ class DistributedAgent:
             upstream_branch=self.cfg.upstream_branch,
             agent_login=self.login,
         )
+        # Symlink the user's copyright-derived toolchain artifacts
+        # (orig/<bin>.exe + config/<bin>.symbols.json) into the fresh clone
+        # so `make diff` (the GREEN grader) can run. These are gitignored in
+        # every clone — they're never carried by `git clone` and are never
+        # committed/pushed in a PR. Degrades gracefully: a missing source
+        # only breaks grading, not claiming / free-set discovery, so we log a
+        # WARNING and continue rather than crashing the whole run.
+        artifacts = provision_toolchain_artifacts(
+            self.clone.path, self.cfg.artifacts_dir, self.cfg.binary
+        )
+        if not artifacts.ok:
+            log.warning(
+                "toolchain artifacts NOT fully provisioned — PR-gate GREEN "
+                "checks will fail until DECOMP_ARTIFACTS_DIR is set: %s",
+                artifacts.warning,
+            )
         self.backend = GitHubClaimBackend(
             clone_path=self.clone.path,
             upstream=self.cfg.upstream,

@@ -116,6 +116,19 @@ class Config:
     # claim.yml CAS takes a few seconds to land the ledger commit.
     claim_poll_timeout_s: int
     claim_poll_interval_s: int
+    # Path to a LOCAL meteor-decomp checkout that already holds the user's
+    # copyright-derived toolchain artifacts — `orig/<bin>.exe` (the SE game
+    # binary) and `config/<bin>.symbols.json` (the Ghidra dump derived from
+    # it). Both are gitignored in every meteor-decomp clone, so a fresh fork
+    # clone never carries them, yet `make diff` (the GREEN grader) needs
+    # both. Distributed mode SYMLINKS them from here into the fork clone so
+    # grading works; they are NEVER copied, committed, or distributed (we
+    # cannot ship copyrighted material — the user supplies their own).
+    # Defaults to `repo` when DECOMP_ARTIFACTS_DIR is unset AND that path
+    # already has an `orig/` dir (the common single-operator case where the
+    # local-mode checkout already holds the artifacts); else None. Local
+    # mode ignores this entirely.
+    artifacts_dir: Path | None
 
     @property
     def yaml_path(self) -> Path:
@@ -324,6 +337,20 @@ def load_config() -> Config:
     else:
         claim_issue = int(claim_issue_raw) if claim_issue_raw.isdigit() else 0
 
+    # Toolchain-artifact source for distributed-mode grading. Explicit env
+    # wins; otherwise fall back to the local `repo` checkout IFF it actually
+    # carries the artifacts (`orig/` present) — this keeps the common
+    # single-operator case zero-config while staying overridable. Never
+    # synthesised in local mode (the worker reads orig/symbols straight from
+    # `repo` there; nothing to symlink).
+    artifacts_dir_env = os.environ.get("DECOMP_ARTIFACTS_DIR", "").strip()
+    if artifacts_dir_env:
+        artifacts_dir: Path | None = Path(artifacts_dir_env).resolve()
+    elif (repo / "orig").is_dir():
+        artifacts_dir = repo
+    else:
+        artifacts_dir = None
+
     return Config(
         repo=repo,
         binary=binary,
@@ -353,4 +380,5 @@ def load_config() -> Config:
         fork_root=fork_root,
         claim_poll_timeout_s=_int_env("DECOMP_CLAIM_POLL_TIMEOUT_S", 180),
         claim_poll_interval_s=_int_env("DECOMP_CLAIM_POLL_INTERVAL_S", 6),
+        artifacts_dir=artifacts_dir,
     )

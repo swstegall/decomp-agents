@@ -838,3 +838,263 @@ def test_e2e_brief_violation_yaml_edit_fails_gate(tmp_path, monkeypatch):
     assert not report.ok
     scope = next(c for c in report.checks if c.name == "one_file_scope")
     assert not scope.ok
+
+
+# ---------------------------------------------------------------------------
+# toolchain-artifact provisioning (distributed-mode GREEN grader)
+# ---------------------------------------------------------------------------
+
+
+def _fake_artifacts_dir(tmp_path: Path, binary: str = "ffxivgame") -> Path:
+    """A stand-in DECOMP_ARTIFACTS_DIR: a dir with fake orig/ + symbols.json.
+
+    No real SE binary is needed — the provisioning only symlinks files, it
+    never reads their contents.
+    """
+    src = tmp_path / "artifacts"
+    (src / "orig").mkdir(parents=True)
+    (src / "config").mkdir(parents=True)
+    (src / "orig" / f"{binary}.exe").write_bytes(b"MZ-fake-binary\x00")
+    (src / "config" / f"{binary}.symbols.json").write_text('[{"rva": 0, "size": 4}]')
+    return src
+
+
+def _empty_clone(tmp_path: Path) -> Path:
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    return clone
+
+
+def test_provision_toolchain_symlinks_both_files(tmp_path):
+    """Given an artifacts dir with orig + symbols, provisioning symlinks both
+    into the clone at the gitignored paths `make diff` reads."""
+    from decomp_agents.fork import provision_toolchain_artifacts
+
+    binary = "ffxivgame"
+    src = _fake_artifacts_dir(tmp_path, binary)
+    clone = _empty_clone(tmp_path)
+
+    result = provision_toolchain_artifacts(clone, src, binary)
+
+    assert result.ok, result.warning
+    orig_link = clone / "orig" / f"{binary}.exe"
+    sym_link = clone / "config" / f"{binary}.symbols.json"
+    assert orig_link.is_symlink()
+    assert sym_link.is_symlink()
+    # Symlinks resolve to the artifacts-dir sources (never copies).
+    assert orig_link.resolve() == (src / "orig" / f"{binary}.exe").resolve()
+    assert sym_link.resolve() == (src / "config" / f"{binary}.symbols.json").resolve()
+    # The configured binary's pair is present and readable through the link.
+    assert orig_link.exists() and sym_link.exists()
+
+
+def test_provision_toolchain_is_idempotent(tmp_path):
+    """Re-running provisioning replaces stale symlinks without error and
+    converges to the same final links."""
+    from decomp_agents.fork import provision_toolchain_artifacts
+
+    binary = "ffxivgame"
+    src = _fake_artifacts_dir(tmp_path, binary)
+    clone = _empty_clone(tmp_path)
+
+    first = provision_toolchain_artifacts(clone, src, binary)
+    assert first.ok
+
+    # Plant a STALE symlink (points at a now-bogus path) to prove it's
+    # replaced rather than tripping on "already exists".
+    stale = clone / "orig" / f"{binary}.exe"
+    stale.unlink()
+    stale.symlink_to(tmp_path / "does-not-exist.exe")
+    assert stale.is_symlink() and not stale.exists()  # broken on purpose
+
+    second = provision_toolchain_artifacts(clone, src, binary)
+    assert second.ok, second.warning
+    assert stale.is_symlink()
+    assert stale.resolve() == (src / "orig" / f"{binary}.exe").resolve()
+
+
+def test_provision_toolchain_none_artifacts_dir_warns_no_crash(tmp_path):
+    """artifacts_dir=None degrades gracefully: a warning + ok=False, no
+    exception, no symlinks created."""
+    from decomp_agents.fork import provision_toolchain_artifacts
+
+    clone = _empty_clone(tmp_path)
+    result = provision_toolchain_artifacts(clone, None, "ffxivgame")
+
+    assert result.ok is False
+    assert result.warning is not None
+    assert "DECOMP_ARTIFACTS_DIR" in result.warning
+    # Nothing was symlinked.
+    assert not (clone / "orig").exists()
+
+
+def test_provision_toolchain_missing_source_files_warns_no_crash(tmp_path):
+    """An artifacts dir that lacks the configured binary's files degrades
+    gracefully: warning + ok=False, no crash."""
+    from decomp_agents.fork import provision_toolchain_artifacts
+
+    # An artifacts dir with empty orig/ + config/ — no <bin>.exe / symbols.
+    src = tmp_path / "artifacts"
+    (src / "orig").mkdir(parents=True)
+    (src / "config").mkdir(parents=True)
+    clone = _empty_clone(tmp_path)
+
+    result = provision_toolchain_artifacts(clone, src, "ffxivgame")
+
+    assert result.ok is False
+    assert result.warning is not None
+    assert "ffxivgame.exe" in result.warning
+    # No symlink was created for the missing source.
+    assert not (clone / "orig" / "ffxivgame.exe").exists()
+
+
+def test_provision_toolchain_partial_only_symbols_present_is_not_ok(tmp_path):
+    """Grading needs BOTH artifacts; only one present ⇒ ok=False with a
+    warning naming the missing file."""
+    from decomp_agents.fork import provision_toolchain_artifacts
+
+    binary = "ffxivgame"
+    src = tmp_path / "artifacts"
+    (src / "orig").mkdir(parents=True)
+    (src / "config").mkdir(parents=True)
+    # Only symbols.json is present; orig/<bin>.exe is missing.
+    (src / "config" / f"{binary}.symbols.json").write_text("[]")
+    clone = _empty_clone(tmp_path)
+
+    result = provision_toolchain_artifacts(clone, src, binary)
+
+    assert result.ok is False
+    assert result.warning is not None and f"orig/{binary}.exe" in result.warning
+    # The present one is still symlinked (so a later fix only needs orig).
+    assert (clone / "config" / f"{binary}.symbols.json").is_symlink()
+
+
+def test_provision_toolchain_links_extra_binaries_when_present(tmp_path):
+    """All five binaries' artifacts are symlinked when present, but only the
+    configured binary's pair gates ok."""
+    from decomp_agents.config import SUPPORTED_BINARIES
+    from decomp_agents.fork import provision_toolchain_artifacts
+
+    src = tmp_path / "artifacts"
+    (src / "orig").mkdir(parents=True)
+    (src / "config").mkdir(parents=True)
+    for stem in SUPPORTED_BINARIES:
+        (src / "orig" / f"{stem}.exe").write_bytes(b"MZ")
+        (src / "config" / f"{stem}.symbols.json").write_text("[]")
+    clone = _empty_clone(tmp_path)
+
+    result = provision_toolchain_artifacts(clone, src, "ffxivlogin")
+
+    assert result.ok
+    for stem in SUPPORTED_BINARIES:
+        assert (clone / "orig" / f"{stem}.exe").is_symlink()
+        assert (clone / "config" / f"{stem}.symbols.json").is_symlink()
+
+
+# ---------------------------------------------------------------------------
+# config: DECOMP_ARTIFACTS_DIR resolution
+# ---------------------------------------------------------------------------
+
+
+def test_config_artifacts_dir_explicit_env_wins(monkeypatch, tmp_path):
+    from decomp_agents import config
+
+    (tmp_path / "repo").mkdir()
+    repo = _git_repo(tmp_path / "repo")
+    art = tmp_path / "art"
+    (art / "orig").mkdir(parents=True)
+    monkeypatch.setenv("DECOMP_REPO", str(repo))
+    monkeypatch.setenv("DECOMP_BINARY", "ffxivlogin")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-foo")
+    monkeypatch.setenv("DECOMP_ARTIFACTS_DIR", str(art))
+    cfg = config.load_config()
+    assert cfg.artifacts_dir == art.resolve()
+
+
+def test_config_artifacts_dir_defaults_to_repo_when_orig_present(monkeypatch, tmp_path):
+    from decomp_agents import config
+
+    (tmp_path / "repo").mkdir()
+    repo = _git_repo(tmp_path / "repo")
+    (repo / "orig").mkdir()
+    monkeypatch.setenv("DECOMP_REPO", str(repo))
+    monkeypatch.setenv("DECOMP_BINARY", "ffxivlogin")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-foo")
+    monkeypatch.delenv("DECOMP_ARTIFACTS_DIR", raising=False)
+    cfg = config.load_config()
+    assert cfg.artifacts_dir == repo.resolve()
+
+
+def test_config_artifacts_dir_none_when_no_orig_and_unset(monkeypatch, tmp_path):
+    from decomp_agents import config
+
+    (tmp_path / "repo").mkdir()
+    repo = _git_repo(tmp_path / "repo")  # no orig/ dir
+    monkeypatch.setenv("DECOMP_REPO", str(repo))
+    monkeypatch.setenv("DECOMP_BINARY", "ffxivlogin")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-foo")
+    monkeypatch.delenv("DECOMP_ARTIFACTS_DIR", raising=False)
+    cfg = config.load_config()
+    assert cfg.artifacts_dir is None
+
+
+# ---------------------------------------------------------------------------
+# COPYRIGHT-LEAK GUARD: symlinked orig/symbols are gitignored in the clone
+# ---------------------------------------------------------------------------
+
+
+def test_symlinked_artifacts_are_gitignored_cannot_leak(tmp_path):
+    """Prove copyrighted material can't leak into a commit/PR: a symlinked
+    `orig/<bin>.exe` and `config/<bin>.symbols.json` inside a clone whose
+    `.gitignore` carries `orig/*` + `config/*.symbols.json` are NOT staged
+    by `git add -A` and report as ignored to `git check-ignore`."""
+    from decomp_agents.fork import provision_toolchain_artifacts
+
+    binary = "ffxivgame"
+    src = _fake_artifacts_dir(tmp_path, binary)
+
+    # A real git repo standing in for the fork clone, carrying the SAME
+    # ignore patterns meteor-decomp's .gitignore uses for these paths.
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    _git(clone, "init", "-q")
+    _git(clone, "config", "user.email", "agent@example.com")
+    _git(clone, "config", "user.name", "agent")
+    (clone / ".gitignore").write_text(
+        "orig/*\n!orig/README.md\n!orig/.gitkeep\nconfig/*.symbols.json\n"
+    )
+    _git(clone, "add", ".gitignore")
+    _git(clone, "commit", "-q", "-m", "base with gitignore")
+
+    result = provision_toolchain_artifacts(clone, src, binary)
+    assert result.ok, result.warning
+
+    rel_orig = f"orig/{binary}.exe"
+    rel_sym = f"config/{binary}.symbols.json"
+
+    # git check-ignore exits 0 (and echoes the path) when the path IS ignored.
+    for rel in (rel_orig, rel_sym):
+        r = subprocess.run(
+            ["git", "-C", str(clone), "check-ignore", rel],
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, f"{rel} is NOT gitignored — copyright could leak!"
+        assert rel in r.stdout
+
+    # `git add -A` must NOT stage either symlink. Only the (already-committed)
+    # .gitignore is tracked; the artifacts stay invisible to git.
+    _git(clone, "add", "-A")
+    staged = _git(clone, "diff", "--cached", "--name-only")
+    assert rel_orig not in staged
+    assert rel_sym not in staged
+    # `git status --porcelain` (no --ignored) shows NOTHING untracked: the
+    # symlinks never surface as candidates to add, so they cannot be
+    # accidentally committed. (`git add -A` above also left the index clean.)
+    assert _git(clone, "status", "--porcelain").strip() == ""
+    # And with --ignored, git reports them as ignored (collapsed to the
+    # whole-directory level, `!! orig/` / `!! config/`, since the entire
+    # dirs are ignored+untracked — that still proves the files can't leak).
+    ignored = _git(clone, "status", "--porcelain", "--ignored")
+    assert "!! orig/" in ignored
+    assert "!! config/" in ignored
