@@ -69,14 +69,90 @@ if [[ -x "$SYNC_REPO/tools/sync-develop.sh" ]]; then
   "$SYNC_REPO/tools/sync-develop.sh" || true
 fi
 
-# 4.6. Push any GREEN matches a prior local-mode run stranded on develop (the
-#       orchestrator isn't running yet, so the script's active-run guard lets
-#       this through). Pushes nothing unless every ahead commit re-grades GREEN.
-if [[ -x "$SYNC_REPO/tools/push-matches.sh" ]]; then
-  echo "[start.sh] pushing any stranded GREEN matches on $SYNC_REPO develop"
-  "$SYNC_REPO/tools/push-matches.sh" || true
+# 4.6. Drain any GREEN matches a prior LOCAL-mode run stranded on develop.
+#       Skip entirely in distributed mode: there the main checkout is never a
+#       push target (matches ship via output/fork PRs), and push-matches.sh's
+#       Phase 0 would `git add`+commit a stray _rosetta file onto develop — a
+#       commit it then can't push, leaving it stranded ("develop ahead 1").
+if [[ "${DECOMP_MODE:-local}" == "local" ]]; then
+  if [[ -x "$SYNC_REPO/tools/push-matches.sh" ]]; then
+    echo "[start.sh] pushing any stranded GREEN matches on $SYNC_REPO develop"
+    "$SYNC_REPO/tools/push-matches.sh" || true
+  fi
+else
+  echo "[start.sh] skipping push-matches.sh (DECOMP_MODE=${DECOMP_MODE:-local}, not local)"
 fi
 
-# 5. Hand off to the orchestrator. Use the console script so the venv's
-#    entry point is what actually runs.
-exec decomp-agents "$@"
+# 5. Hand off to the orchestrator.
+#
+#    LOCAL mode: orchestrator.main() blocks for the whole session (it owns the
+#    workers + merge loop and installs its own signal handling), so keep the
+#    original single `exec` — run-once-then-stop is preserved byte-for-byte.
+#
+#    DISTRIBUTED mode: one DistributedAgent.run() pass is intentionally bounded
+#    (discover free set, attempt <= MAX_ATTEMPTS functions, exit). Supervise it
+#    in a loop so work keeps draining across passes until the operator hits
+#    Ctrl+C.
+if [[ "${DECOMP_MODE:-local}" != "distributed" ]]; then
+  exec decomp-agents "$@"
+fi
+
+BUSY_SLEEP="${DECOMP_SUPERVISE_BUSY_SLEEP:-5}"    # gap after a pass that did work
+IDLE_SLEEP="${DECOMP_SUPERVISE_IDLE_SLEEP:-60}"   # backoff when the free set was empty
+MAX_SLEEP="${DECOMP_SUPERVISE_MAX_SLEEP:-300}"    # cap on escalating idle backoff
+
+_stop=0
+_child=0
+on_signal() {
+  _stop=1
+  [[ "$_child" -ne 0 ]] && kill -TERM "$_child" 2>/dev/null || true
+}
+trap on_signal INT TERM
+
+# Interruptible sleep: a Ctrl+C during the gap returns immediately instead of
+# blocking the full duration.
+nap() {
+  local secs="$1"
+  [[ "$secs" -le 0 ]] && return 0
+  sleep "$secs" &
+  _child=$!
+  wait "$_child" 2>/dev/null || true
+  _child=0
+}
+
+echo "[start.sh] supervising decomp-agents (distributed) — Ctrl+C to stop"
+idle_backoff="$IDLE_SLEEP"
+while [[ "$_stop" -eq 0 ]]; do
+  # Run one bounded pass as a backgrounded child so the bash trap fires on
+  # Ctrl+C even mid-pass. Disable -e around it so a non-zero pass (a crash, a
+  # transient gh hiccup) doesn't abort the supervisor.
+  set +e
+  decomp-agents "$@" &
+  _child=$!
+  wait "$_child"
+  rc=$?
+  _child=0
+  set -e
+
+  [[ "$_stop" -ne 0 ]] && break
+  if [[ "$rc" -eq 130 || "$rc" -eq 143 ]]; then
+    echo "[start.sh] orchestrator interrupted (rc=$rc) — stopping"
+    break
+  fi
+
+  if [[ "$rc" -eq 75 ]]; then
+    # No claimable work this pass: back off (escalating up to MAX_SLEEP) so an
+    # empty free set doesn't hot-spin / re-provision the fork every few seconds.
+    echo "[start.sh] no claimable work — sleeping ${idle_backoff}s"
+    nap "$idle_backoff"
+    idle_backoff=$(( idle_backoff * 2 ))
+    [[ "$idle_backoff" -gt "$MAX_SLEEP" ]] && idle_backoff="$MAX_SLEEP"
+  else
+    [[ "$rc" -ne 0 ]] && echo "[start.sh] pass exited rc=$rc — retrying after ${BUSY_SLEEP}s"
+    idle_backoff="$IDLE_SLEEP"   # reset backoff after a productive/normal pass
+    nap "$BUSY_SLEEP"
+  fi
+done
+
+echo "[start.sh] supervisor stopped"
+exit 0

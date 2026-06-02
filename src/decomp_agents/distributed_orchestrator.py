@@ -256,6 +256,13 @@ class DistributedAgent:
         log.info(
             "distributed run done: attempts=%d prs_opened=%d", attempts, opened
         )
+        # 75 == EX_TEMPFAIL: nothing was claimable/attempted this pass (empty
+        # free set, or every candidate lost its claim before an attempt). The
+        # start.sh supervisor reads this to back off instead of hot-spinning
+        # and re-provisioning the fork every few seconds. Any pass that did
+        # work (or tried and failed) returns 0.
+        if attempts == 0:
+            return 75
         return 0
 
 

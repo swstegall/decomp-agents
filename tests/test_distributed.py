@@ -740,6 +740,38 @@ def test_local_brief_unchanged(tmp_path):
     assert "make rosetta" not in brief
 
 
+def test_distributed_brief_points_at_clone_not_main_checkout(tmp_path):
+    """Distributed brief must reference the fork clone (repo_root), never cfg.repo.
+
+    Regression: _function_brief used to hardcode cfg.repo in its 'Workspace
+    context' section. In distributed mode cfg.repo is the MAIN meteor-decomp
+    checkout (DECOMP_REPO, the read-only artifacts source) while the SDK runs
+    with cwd=the fork clone — so the brief told the agent to "stay in" a tree it
+    wasn't running in, which let it write stray src/<bin>/_rosetta/*.cpp files
+    into the main checkout. The brief must point at the clone it runs in.
+    """
+    from decomp_agents.worker import _function_brief
+
+    main_checkout = tmp_path / "meteor-decomp"   # cfg.repo / DECOMP_REPO
+    clone = tmp_path / "fork"                     # the SDK cwd in distributed mode
+    fn = _fn()
+    brief = _function_brief(
+        fn, _min_config(main_checkout), _ctx(), distributed=True, repo_root=clone
+    )
+
+    # Points the agent at the clone it actually runs in...
+    assert str(clone) in brief
+    # ...and never at the main checkout, nor claims a shared .git.
+    assert str(main_checkout) not in brief
+    assert "sharing the same .git" not in brief
+
+    # Local mode is the opposite: it DOES reference cfg.repo + the shared .git
+    # (the worktree genuinely shares it), and must stay that way.
+    local = _function_brief(fn, _min_config(main_checkout), _ctx(), distributed=False)
+    assert str(main_checkout) in local
+    assert "sharing the same .git" in local
+
+
 # ---------------------------------------------------------------------------
 # END-TO-END: real distributed brief output -> run_pr_gate (toolchain-free)
 # ---------------------------------------------------------------------------
