@@ -100,7 +100,12 @@ def _build_options(
 
 
 def _function_brief(
-    fn: Function, cfg: Config, ctx: PromptContext, *, distributed: bool = False
+    fn: Function,
+    cfg: Config,
+    ctx: PromptContext,
+    *,
+    distributed: bool = False,
+    repo_root: Path | None = None,
 ) -> str:
     """The per-function task prompt fed to the agent for ONE function.
 
@@ -123,6 +128,15 @@ def _function_brief(
     The shared asm/sibling-reading steps (1, 2) and the diff-verdict /
     canonical-fixes loop (5–8) are identical in both modes.
     """
+    # The agent's actual write root. In distributed mode the orchestrator
+    # runs the SDK with cwd=the fork clone (a STANDALONE clone, NOT a
+    # worktree of cfg.repo), so the brief must point there — never at
+    # cfg.repo, which in distributed mode is the MAIN checkout (DECOMP_REPO,
+    # also the read-only artifacts source). Pointing the agent at cfg.repo is
+    # what let it write stray _rosetta/*.cpp files into the main checkout. In
+    # local mode repo_root is None and we fall back to cfg.repo so the prompt
+    # is byte-for-byte unchanged.
+    root = repo_root or cfg.repo
     max_iters = cfg.max_iterations_per_function
 
     head = f"""You are matching ONE function from {fn.binary}.exe.
@@ -147,7 +161,25 @@ def _function_brief(
         else _local_loop(fn, max_iters)
     )
 
-    workspace = f"""
+    if distributed:
+        workspace = f"""
+## Workspace context (read-only)
+
+  - `{root}/AGENTS.md` — the matching-workflow contract + canonical fixes table
+
+Stay in THIS clone at `{root}` and write ONLY inside it. It is a
+STANDALONE clone of the fork — it does NOT share a `.git` with any other
+checkout. Never write to, `cd` into, or reference any path outside
+`{root}`. The only file you create is the single
+`src/{fn.binary}/_rosetta/{fn.symbol}.cpp` described in your loop below,
+under THIS clone.
+
+You CANNOT open Ghidra (`*.gpr` files are a GUI artefact, not readable
+text). All your decompilation hints come from the asm dump and the
+optional headless pseudo-C above.
+"""
+    else:
+        workspace = f"""
 ## Workspace context (read-only)
 
   - `{cfg.repo.parent}/CLAUDE.md` — workspace overview + every dump's
@@ -249,7 +281,7 @@ own the YAML status; a PR that touches them will be rejected by the gate.
      for wholesale wrong. **Only GREEN is a match.**
   6. If GREEN: continue to step 8.
   7. If PARTIAL/MISMATCH: pick the most-likely cause from the canonical
-     fixes table (in `meteor-decomp/AGENTS.md` and
+     fixes table (in `AGENTS.md` and
      `docs/matching-workflow.md` §7) and try ONE adjustment. Recompile
      + re-diff. Repeat up to {max_iters} times.
   8. `git add` ONLY `{rosetta}` (nothing else — no YAML, no notes added to
@@ -320,9 +352,15 @@ async def run_match_loop(
         agent_id=agent_id,
         model=model,
     )
-    user_prompt = _function_brief(fn, cfg, ctx, distributed=distributed).replace(
-        "{max_iters}", str(cfg.max_iterations_per_function)
-    )
+    user_prompt = _function_brief(
+        fn,
+        cfg,
+        ctx,
+        distributed=distributed,
+        # cwd IS the fork clone in distributed mode; keep local mode None so
+        # the brief falls back to cfg.repo and renders byte-for-byte as before.
+        repo_root=cwd if distributed else None,
+    ).replace("{max_iters}", str(cfg.max_iterations_per_function))
 
     iterations = 0
     bailed = False
