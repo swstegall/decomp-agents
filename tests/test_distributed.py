@@ -599,6 +599,38 @@ def test_build_pr_body_mentions_va_and_attribution():
     assert "Claude Code" in body
 
 
+def test_shard_functions_identity_when_count_le_1():
+    from decomp_agents.distributed_orchestrator import shard_functions
+
+    fns = [_fn(rva=0x1000 + i) for i in range(10)]
+    assert shard_functions(fns, index=0, count=1) == fns
+    assert shard_functions(fns, index=0, count=0) == fns  # defensive: treat as no-shard
+
+
+def test_shard_functions_partitions_disjointly_and_completely():
+    """N shards must be disjoint, cover every function, and be stable per-VA."""
+    from decomp_agents.distributed_orchestrator import shard_functions
+
+    fns = [_fn(rva=r) for r in range(0x1000, 0x1000 + 200)]
+    n = 8
+    shards = [shard_functions(fns, index=i, count=n) for i in range(n)]
+
+    # Every function lands in exactly its rva-residue shard...
+    for i, shard in enumerate(shards):
+        assert all(fn.rva % n == i for fn in shard)
+    # ...the shards are pairwise disjoint and their union is the whole set...
+    seen = [fn.rva for shard in shards for fn in shard]
+    assert sorted(seen) == sorted(fn.rva for fn in fns)
+    assert len(seen) == len(set(seen))
+    # ...and a VA's shard depends only on its address, not on which snapshot it
+    # appeared in (so two processes with divergent free sets never collide).
+    subset = [fn for fn in fns if fn.rva % 3 != 0]  # a different membership
+    for i in range(n):
+        full_i = {fn.rva for fn in shard_functions(fns, index=i, count=n)}
+        sub_i = {fn.rva for fn in shard_functions(subset, index=i, count=n)}
+        assert sub_i <= full_i
+
+
 def test_function_branch_name():
     from decomp_agents.fork import function_branch_name
 
