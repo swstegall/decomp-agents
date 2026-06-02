@@ -129,6 +129,17 @@ class Config:
     # local-mode checkout already holds the artifacts); else None. Local
     # mode ignores this entirely.
     artifacts_dir: Path | None
+    # Distributed-mode horizontal sharding. To run N independent agent
+    # processes for throughput (each its own fork clone + output dir), each
+    # process claims ONLY the VAs in its residue class — `rva % shard_count ==
+    # shard_index` — so two of OUR OWN same-identity processes never attempt
+    # the same VA (the upstream claim ledger only dedups across DIFFERENT gh
+    # logins, and treats a same-owner re-claim as a lease extension). The
+    # ledger still coordinates against other contributors. Defaults 0/1 mean
+    # "no sharding" (single process), so existing runs are unchanged. Read
+    # only in distributed mode.
+    shard_index: int
+    shard_count: int
 
     @property
     def yaml_path(self) -> Path:
@@ -351,6 +362,17 @@ def load_config() -> Config:
     else:
         artifacts_dir = None
 
+    # Distributed-mode sharding (0/1 = single process; harmless in local mode).
+    shard_index = _int_env("DECOMP_SHARD_INDEX", 0)
+    shard_count = _int_env("DECOMP_SHARD_COUNT", 1)
+    if shard_count < 1:
+        raise RuntimeError(f"DECOMP_SHARD_COUNT={shard_count} must be >= 1")
+    if not (0 <= shard_index < shard_count):
+        raise RuntimeError(
+            f"DECOMP_SHARD_INDEX={shard_index} out of range for "
+            f"DECOMP_SHARD_COUNT={shard_count} (need 0 <= index < count)"
+        )
+
     return Config(
         repo=repo,
         binary=binary,
@@ -381,4 +403,6 @@ def load_config() -> Config:
         claim_poll_timeout_s=_int_env("DECOMP_CLAIM_POLL_TIMEOUT_S", 180),
         claim_poll_interval_s=_int_env("DECOMP_CLAIM_POLL_INTERVAL_S", 6),
         artifacts_dir=artifacts_dir,
+        shard_index=shard_index,
+        shard_count=shard_count,
     )

@@ -56,6 +56,22 @@ log = logging.getLogger(__name__)
 SCHEMA_PATH = Path(__file__).resolve().parent.parent.parent / "schema" / "coordination.sql"
 
 
+def shard_functions(
+    functions: list[Function], *, index: int, count: int
+) -> list[Function]:
+    """Return the `index`-th of `count` disjoint shards of `functions`.
+
+    Partitions by ``rva % count`` so every function lands in exactly one shard.
+    N independent distributed processes (one per shard) therefore never attempt
+    the same VA — even when their free-set snapshots drift apart in time, since
+    a VA's shard is a pure function of its address, not of list position.
+    ``count <= 1`` is the no-shard identity (single-process mode).
+    """
+    if count <= 1:
+        return list(functions)
+    return [fn for fn in functions if fn.rva % count == index]
+
+
 class DistributedAgent:
     """One fork-side agent: claim → match → gate → PR, repeated."""
 
@@ -83,6 +99,11 @@ class DistributedAgent:
             target=self.cfg.fork_root,
             upstream_branch=self.cfg.upstream_branch,
             agent_login=self.login,
+            # Borrow objects from the local meteor-decomp checkout (a clone of
+            # the same upstream) so N sharded shard clones don't each re-store
+            # the full history. artifacts_dir is the same checkout when set;
+            # fall back to cfg.repo (validated to be a git repo at load time).
+            reference=self.cfg.artifacts_dir or self.cfg.repo,
         )
         # Symlink the user's copyright-derived toolchain artifacts
         # (orig/<bin>.exe + config/<bin>.symbols.json) into the fresh clone
@@ -123,7 +144,7 @@ class DistributedAgent:
         # The YAML pool for distributed mode comes from the fork clone, not
         # the local DECOMP_REPO checkout.
         yaml_path = self.clone.path / "config" / f"{self.cfg.binary}.yaml"
-        return discover_free_set(
+        candidates = discover_free_set(
             clone_path=self.clone.path,
             upstream=self.cfg.upstream,
             binary=self.cfg.binary,
@@ -132,6 +153,23 @@ class DistributedAgent:
             yaml_path=yaml_path,
             max_size=self.cfg.max_function_size,
         )
+        # When this process is one of N sharded workers, keep only our residue
+        # class so we never contend with our own sibling processes for a VA.
+        if self.cfg.shard_count > 1:
+            before = len(candidates)
+            candidates = shard_functions(
+                candidates,
+                index=self.cfg.shard_index,
+                count=self.cfg.shard_count,
+            )
+            log.info(
+                "shard %d/%d: %d of %d free function(s) in this residue class",
+                self.cfg.shard_index,
+                self.cfg.shard_count,
+                len(candidates),
+                before,
+            )
+        return candidates
 
     # --- per-function -----------------------------------------------------
 

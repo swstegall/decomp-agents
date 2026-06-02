@@ -88,71 +88,99 @@ fi
 #    LOCAL mode: orchestrator.main() blocks for the whole session (it owns the
 #    workers + merge loop and installs its own signal handling), so keep the
 #    original single `exec` — run-once-then-stop is preserved byte-for-byte.
-#
-#    DISTRIBUTED mode: one DistributedAgent.run() pass is intentionally bounded
-#    (discover free set, attempt <= MAX_ATTEMPTS functions, exit). Supervise it
-#    in a loop so work keeps draining across passes until the operator hits
-#    Ctrl+C.
 if [[ "${DECOMP_MODE:-local}" != "distributed" ]]; then
   exec decomp-agents "$@"
 fi
 
+#    DISTRIBUTED mode: one DistributedAgent.run() pass is intentionally bounded
+#    (discover free set, attempt <= MAX_ATTEMPTS functions, exit). Run
+#    DECOMP_AGENT_WORKERS such processes concurrently for throughput, each with
+#    its OWN fork clone + output dir and its OWN VA residue class (shard), and
+#    supervise each so work keeps draining across passes until Ctrl+C. The
+#    shards never contend for the same VA (rva % N partition); the upstream
+#    claim ledger still coordinates against other contributors.
+NPROC="${DECOMP_AGENT_WORKERS:-1}"
+[[ "$NPROC" =~ ^[0-9]+$ ]] && [[ "$NPROC" -ge 1 ]] || NPROC=1
+
 BUSY_SLEEP="${DECOMP_SUPERVISE_BUSY_SLEEP:-5}"    # gap after a pass that did work
 IDLE_SLEEP="${DECOMP_SUPERVISE_IDLE_SLEEP:-60}"   # backoff when the free set was empty
 MAX_SLEEP="${DECOMP_SUPERVISE_MAX_SLEEP:-300}"    # cap on escalating idle backoff
+STAGGER="${DECOMP_SHARD_STAGGER_S:-3}"            # per-shard startup stagger (claim politeness)
+BASE_OUTPUT_DIR="${DECOMP_OUTPUT_DIR:-$SCRIPT_DIR/output}"
 
-_stop=0
-_child=0
-on_signal() {
-  _stop=1
-  [[ "$_child" -ne 0 ]] && kill -TERM "$_child" 2>/dev/null || true
-}
-trap on_signal INT TERM
+# One shard's persistent supervisor (runs backgrounded; reaped by the parent).
+# Re-runs its bounded distributed pass until the parent SIGTERMs it. Args:
+#   $1 = shard index, $2 = shard count, then the original CLI args ("$@").
+supervise_shard() {
+  local idx="$1" count="$2"; shift 2
+  local tag="[start.sh shard ${idx}/${count}]"
+  local s_stop=0 child=0 rc backoff="$IDLE_SLEEP" shard_out
 
-# Interruptible sleep: a Ctrl+C during the gap returns immediately instead of
-# blocking the full duration.
-nap() {
-  local secs="$1"
-  [[ "$secs" -le 0 ]] && return 0
-  sleep "$secs" &
-  _child=$!
-  wait "$_child" 2>/dev/null || true
-  _child=0
-}
+  # Backgrounded shells ignore SIGINT under `set -m`-off job control, so the
+  # parent forwards a SIGTERM; handle it by killing the current pass and exiting.
+  shard_stop() { s_stop=1; [[ "$child" -ne 0 ]] && kill -TERM "$child" 2>/dev/null || true; }
+  trap shard_stop TERM INT
 
-echo "[start.sh] supervising decomp-agents (distributed) — Ctrl+C to stop"
-idle_backoff="$IDLE_SLEEP"
-while [[ "$_stop" -eq 0 ]]; do
-  # Run one bounded pass as a backgrounded child so the bash trap fires on
-  # Ctrl+C even mid-pass. Disable -e around it so a non-zero pass (a crash, a
-  # transient gh hiccup) doesn't abort the supervisor.
-  set +e
-  decomp-agents "$@" &
-  _child=$!
-  wait "$_child"
-  rc=$?
-  _child=0
-  set -e
+  # N==1 keeps the original single-process output dir (and reuses output/fork);
+  # N>1 gives each shard its own clone + DB + transcripts under output/agent-N.
+  if [[ "$count" -le 1 ]]; then shard_out="$BASE_OUTPUT_DIR"; else shard_out="$BASE_OUTPUT_DIR/agent-${idx}"; fi
 
-  [[ "$_stop" -ne 0 ]] && break
-  if [[ "$rc" -eq 130 || "$rc" -eq 143 ]]; then
-    echo "[start.sh] orchestrator interrupted (rc=$rc) — stopping"
-    break
+  # Stagger startup so N shards don't post their first /claim at the same instant.
+  if [[ "$idx" -gt 0 && "$STAGGER" -gt 0 ]]; then
+    sleep $(( idx * STAGGER )) & child=$!; wait "$child" 2>/dev/null || true; child=0
+    [[ "$s_stop" -ne 0 ]] && { echo "$tag stopped"; return 0; }
   fi
 
-  if [[ "$rc" -eq 75 ]]; then
-    # No claimable work this pass: back off (escalating up to MAX_SLEEP) so an
-    # empty free set doesn't hot-spin / re-provision the fork every few seconds.
-    echo "[start.sh] no claimable work — sleeping ${idle_backoff}s"
-    nap "$idle_backoff"
-    idle_backoff=$(( idle_backoff * 2 ))
-    [[ "$idle_backoff" -gt "$MAX_SLEEP" ]] && idle_backoff="$MAX_SLEEP"
-  else
-    [[ "$rc" -ne 0 ]] && echo "[start.sh] pass exited rc=$rc — retrying after ${BUSY_SLEEP}s"
-    idle_backoff="$IDLE_SLEEP"   # reset backoff after a productive/normal pass
-    nap "$BUSY_SLEEP"
-  fi
+  echo "$tag starting (output=$shard_out)"
+  while [[ "$s_stop" -eq 0 ]]; do
+    # Background the pass + wait so the trap fires on signal even mid-pass.
+    # Disable -e so a non-zero pass (crash / transient gh hiccup) doesn't abort.
+    set +e
+    DECOMP_SHARD_INDEX="$idx" DECOMP_SHARD_COUNT="$count" DECOMP_OUTPUT_DIR="$shard_out" \
+      decomp-agents "$@" &
+    child=$!
+    wait "$child"; rc=$?
+    child=0
+    set -e
+
+    [[ "$s_stop" -ne 0 ]] && break
+    if [[ "$rc" -eq 130 || "$rc" -eq 143 ]]; then echo "$tag interrupted (rc=$rc)"; break; fi
+
+    if [[ "$rc" -eq 75 ]]; then
+      # No claimable work in this shard: back off (escalating up to MAX_SLEEP).
+      echo "$tag no claimable work — sleeping ${backoff}s"
+      sleep "$backoff" & child=$!; wait "$child" 2>/dev/null || true; child=0
+      backoff=$(( backoff * 2 )); [[ "$backoff" -gt "$MAX_SLEEP" ]] && backoff="$MAX_SLEEP"
+    else
+      [[ "$rc" -ne 0 ]] && echo "$tag pass exited rc=$rc — retrying after ${BUSY_SLEEP}s"
+      backoff="$IDLE_SLEEP"   # reset backoff after a productive/normal pass
+      sleep "$BUSY_SLEEP" & child=$!; wait "$child" 2>/dev/null || true; child=0
+    fi
+  done
+  echo "$tag stopped"
+}
+
+# Parent: launch N shard supervisors and forward Ctrl+C / SIGTERM to all of them.
+shard_pids=()
+parent_stop() {
+  echo "[start.sh] stopping ${#shard_pids[@]} shard supervisor(s)…"
+  for p in "${shard_pids[@]}"; do kill -TERM "$p" 2>/dev/null || true; done
+}
+trap parent_stop INT TERM
+
+echo "[start.sh] supervising $NPROC distributed shard(s) — Ctrl+C to stop"
+for (( i=0; i<NPROC; i++ )); do
+  supervise_shard "$i" "$NPROC" "$@" &
+  shard_pids+=("$!")
 done
 
-echo "[start.sh] supervisor stopped"
+# Block until every shard supervisor has exited. A trapped Ctrl+C interrupts
+# `wait` and runs parent_stop (which SIGTERMs the shards); we then reap each.
+for p in "${shard_pids[@]}"; do
+  while kill -0 "$p" 2>/dev/null; do
+    wait "$p" 2>/dev/null && break || true
+  done
+done
+
+echo "[start.sh] all shard supervisors stopped"
 exit 0
