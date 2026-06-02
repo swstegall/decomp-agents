@@ -631,6 +631,32 @@ def test_shard_functions_partitions_disjointly_and_completely():
         assert sub_i <= full_i
 
 
+def test_clone_argv_borrows_objects_from_present_reference(tmp_path):
+    from decomp_agents.fork import _clone_argv
+
+    ref = tmp_path / "ref"
+    ref.mkdir()
+    dst = tmp_path / "dst"
+    argv = _clone_argv("https://github.com/o/r.git", dst, ref)
+
+    assert "--reference-if-able" in argv
+    assert str(ref) in argv
+    # url + destination remain the trailing positionals, in order.
+    assert argv[-2:] == ["https://github.com/o/r.git", str(dst)]
+
+
+def test_clone_argv_skips_reference_when_absent_or_missing(tmp_path):
+    from decomp_agents.fork import _clone_argv
+
+    dst = tmp_path / "dst"
+    # No reference at all.
+    assert _clone_argv("u", dst, None) == ["git", "clone", "u", str(dst)]
+    # A reference path that doesn't exist is skipped (the flag would error
+    # without -if-able semantics, and there's no point borrowing from nothing).
+    argv = _clone_argv("u", dst, tmp_path / "missing")
+    assert "--reference-if-able" not in argv
+
+
 def test_function_branch_name():
     from decomp_agents.fork import function_branch_name
 

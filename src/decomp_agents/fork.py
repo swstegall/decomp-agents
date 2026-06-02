@@ -130,6 +130,23 @@ def _origin_owner(clone: Path, fallback: str) -> str:
     return fallback
 
 
+def _clone_argv(url: str, target: Path, reference: Path | None) -> list[str]:
+    """Build the `git clone` argv, optionally borrowing objects from a reference.
+
+    When `reference` is a local clone of the same upstream (e.g. DECOMP_REPO),
+    `--reference-if-able` lets the new clone share its object store via
+    `.git/objects/info/alternates` instead of re-downloading and re-storing the
+    full history — so N shard clones cost a small fraction of the disk one full
+    clone would. The `-if-able` form degrades to an ordinary clone if the
+    reference is missing or unusable, so it is always safe to pass.
+    """
+    argv = ["git", "clone"]
+    if reference is not None and reference.exists():
+        argv += ["--reference-if-able", str(reference)]
+    argv += [url, str(target)]
+    return argv
+
+
 def provision_fork(
     *,
     upstream: str,
@@ -137,6 +154,7 @@ def provision_fork(
     target: Path,
     upstream_branch: str = "develop",
     agent_login: str | None = None,
+    reference: Path | None = None,
 ) -> ForkClone:
     """Provision a working clone of the contributor's fork.
 
@@ -148,6 +166,13 @@ def provision_fork(
         clones it, wiring `upstream` automatically.
       - if `fork` is "owner/repo" or a URL: `git clone` it directly, then
         add the `upstream` remote by hand.
+
+    `reference` (when given and a valid local clone of the same upstream) is
+    passed to `git clone --reference-if-able` so the new clone borrows that
+    repo's objects — the difference between N full clones and N cheap ones when
+    running sharded distributed workers. Only the direct `git clone` path
+    honours it (the `gh repo fork` path doesn't expose git-clone flags); the
+    flag degrades gracefully, so it's harmless when unused.
 
     Then `git fetch upstream <branch>` so the solved set + base ref are
     current. Returns a :class:`ForkClone`.
@@ -180,7 +205,9 @@ def provision_fork(
     else:
         url = fork if "://" in fork or fork.startswith("git@") else f"https://github.com/{fork}.git"
         log.info("cloning fork %s into %s", url, target)
-        _run(["git", "clone", url, str(target)], check=True)
+        if reference is not None and reference.exists():
+            log.info("borrowing objects from local reference %s", reference)
+        _run(_clone_argv(url, target, reference), check=True)
         _ensure_upstream_remote(target, upstream)
 
     # Refresh the upstream base + the claims ledger branch so the solved

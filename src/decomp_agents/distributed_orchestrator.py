@@ -99,6 +99,11 @@ class DistributedAgent:
             target=self.cfg.fork_root,
             upstream_branch=self.cfg.upstream_branch,
             agent_login=self.login,
+            # Borrow objects from the local meteor-decomp checkout (a clone of
+            # the same upstream) so N sharded shard clones don't each re-store
+            # the full history. artifacts_dir is the same checkout when set;
+            # fall back to cfg.repo (validated to be a git repo at load time).
+            reference=self.cfg.artifacts_dir or self.cfg.repo,
         )
         # Symlink the user's copyright-derived toolchain artifacts
         # (orig/<bin>.exe + config/<bin>.symbols.json) into the fresh clone
