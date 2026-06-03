@@ -56,20 +56,45 @@ log = logging.getLogger(__name__)
 SCHEMA_PATH = Path(__file__).resolve().parent.parent.parent / "schema" / "coordination.sql"
 
 
+def _shard_key(rva: int) -> int:
+    """A well-mixed 32-bit hash of an RVA (murmur3 fmix32 finalizer).
+
+    We must NOT shard on ``rva`` directly: MSVC aligns function entry points
+    (16 bytes for ``ffxivgame``), so the low bits carry almost no entropy and
+    ``rva % count`` collapses ~99% of the eligible pool into residue 0 — the
+    non-aligned RVAs are precisely the thunks/naked-stubs the eligibility
+    filter drops, so shards 1..count-1 starve while shard 0 hoards the work.
+    This finalizer avalanches the high bits down into the low bits so
+    ``_shard_key(rva) % count`` is ~uniform regardless of alignment. It is a
+    pure, deterministic function of ``rva`` (no PYTHONHASHSEED randomness), so
+    a VA always maps to the same shard across independent agent processes.
+    """
+    x = rva & 0xFFFFFFFF
+    x ^= x >> 16
+    x = (x * 0x85EBCA6B) & 0xFFFFFFFF
+    x ^= x >> 13
+    x = (x * 0xC2B2AE35) & 0xFFFFFFFF
+    x ^= x >> 16
+    return x
+
+
 def shard_functions(
     functions: list[Function], *, index: int, count: int
 ) -> list[Function]:
     """Return the `index`-th of `count` disjoint shards of `functions`.
 
-    Partitions by ``rva % count`` so every function lands in exactly one shard.
-    N independent distributed processes (one per shard) therefore never attempt
-    the same VA — even when their free-set snapshots drift apart in time, since
-    a VA's shard is a pure function of its address, not of list position.
-    ``count <= 1`` is the no-shard identity (single-process mode).
+    Partitions by ``_shard_key(rva) % count`` so every function lands in
+    exactly one shard. N independent distributed processes (one per shard)
+    therefore never attempt the same VA — even when their free-set snapshots
+    drift apart in time, since a VA's shard is a pure function of its address,
+    not of list position. Sharding on the *hashed* RVA (not the raw RVA) keeps
+    the partition balanced despite function-entry alignment — see
+    :func:`_shard_key`. ``count <= 1`` is the no-shard identity (single-process
+    mode).
     """
     if count <= 1:
         return list(functions)
-    return [fn for fn in functions if fn.rva % count == index]
+    return [fn for fn in functions if _shard_key(fn.rva) % count == index]
 
 
 class DistributedAgent:

@@ -609,15 +609,15 @@ def test_shard_functions_identity_when_count_le_1():
 
 def test_shard_functions_partitions_disjointly_and_completely():
     """N shards must be disjoint, cover every function, and be stable per-VA."""
-    from decomp_agents.distributed_orchestrator import shard_functions
+    from decomp_agents.distributed_orchestrator import _shard_key, shard_functions
 
     fns = [_fn(rva=r) for r in range(0x1000, 0x1000 + 200)]
     n = 8
     shards = [shard_functions(fns, index=i, count=n) for i in range(n)]
 
-    # Every function lands in exactly its rva-residue shard...
+    # Every function lands in exactly its hashed-rva-residue shard...
     for i, shard in enumerate(shards):
-        assert all(fn.rva % n == i for fn in shard)
+        assert all(_shard_key(fn.rva) % n == i for fn in shard)
     # ...the shards are pairwise disjoint and their union is the whole set...
     seen = [fn.rva for shard in shards for fn in shard]
     assert sorted(seen) == sorted(fn.rva for fn in fns)
@@ -629,6 +629,31 @@ def test_shard_functions_partitions_disjointly_and_completely():
         full_i = {fn.rva for fn in shard_functions(fns, index=i, count=n)}
         sub_i = {fn.rva for fn in shard_functions(subset, index=i, count=n)}
         assert sub_i <= full_i
+
+
+def test_shard_functions_balanced_on_aligned_rvas():
+    """Regression: 16-byte-aligned function entry points must NOT collapse
+    into one shard.
+
+    Real MSVC binaries align function starts (ffxivgame: 16 bytes), so the low
+    bits of `rva` are ~constant. Sharding on the raw `rva % count` put ~99% of
+    the eligible pool in residue 0 and starved shards 1..count-1. The hashed
+    key must spread aligned RVAs roughly evenly.
+    """
+    from decomp_agents.distributed_orchestrator import shard_functions
+
+    # 4000 functions, all 16-byte aligned — the pathological input.
+    fns = [_fn(rva=0x401000 + 16 * i) for i in range(4000)]
+    n = 8
+    sizes = [len(shard_functions(fns, index=i, count=n)) for i in range(n)]
+
+    # Disjoint + complete still holds.
+    assert sum(sizes) == len(fns)
+    # No shard is starved: every shard gets a healthy share (ideal = 500).
+    # A correct hash lands each well within 2x of the mean; the broken
+    # `rva % 8` version produced [4000, 0, 0, 0, 0, 0, 0, 0].
+    assert min(sizes) > len(fns) // n // 2, sizes
+    assert max(sizes) < len(fns) // n * 2, sizes
 
 
 def test_clone_argv_borrows_objects_from_present_reference(tmp_path):
