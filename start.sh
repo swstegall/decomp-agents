@@ -146,6 +146,14 @@ supervise_shard() {
     [[ "$s_stop" -ne 0 ]] && break
     if [[ "$rc" -eq 130 || "$rc" -eq 143 ]]; then echo "$tag interrupted (rc=$rc)"; break; fi
 
+    if [[ "$rc" -eq 78 ]]; then
+      # EX_CONFIG: the coordination issue is at GitHub's 2,500-comment cap, so
+      # no shard can claim. Hot-looping is pointless — stop this shard and let
+      # the operator open a fresh issue + re-point DECOMP_CLAIM_ISSUE.
+      echo "$tag claim issue is full (rc=78) — rotate DECOMP_CLAIM_ISSUE; stopping shard"
+      break
+    fi
+
     if [[ "$rc" -eq 75 ]]; then
       # No claimable work in this shard: back off (escalating up to MAX_SLEEP).
       echo "$tag no claimable work — sleeping ${backoff}s"

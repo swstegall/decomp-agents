@@ -45,6 +45,24 @@ log = logging.getLogger(__name__)
 
 IMAGE_BASE = 0x400000
 
+# GitHub's hard per-issue/PR comment ceiling. Once a coordination issue holds
+# this many comments, the REST API rejects every further `POST .../comments`
+# with HTTP 422 and commenting is permanently disabled for that issue. When
+# that happens, no `/claim` lands, `claim.yml` never fires, the ledger never
+# updates, and every claim() silently times out — so we detect it and fail
+# loudly with an actionable message instead of churning the free set.
+GH_ISSUE_COMMENT_CAP = 2500
+
+
+class ClaimIssueFullError(RuntimeError):
+    """The coordination issue has hit GitHub's comment cap (rotate it).
+
+    Raised by :meth:`GitHubClaimBackend.claim` when a `/claim` comment cannot
+    be posted because the issue is at :data:`GH_ISSUE_COMMENT_CAP`. This is a
+    permanent condition for that issue — the operator must open a fresh
+    coordination issue and re-point ``DECOMP_CLAIM_ISSUE`` at it.
+    """
+
 # A ledger claim is "won" by us iff its owner matches AND its state is one
 # of these. (`tools/claim.py` writes active|expiring|pinned-by-PR; an
 # expiring claim still belongs to its owner during the grace window.)
@@ -174,7 +192,13 @@ class GitHubClaimBackend:
 
     # --- comment posting --------------------------------------------------
 
-    def _post_claim_comment(self, va: int, *, unclaim: bool = False) -> None:
+    def _post_claim_comment(self, va: int, *, unclaim: bool = False) -> bool:
+        """Post a `/claim` (or `/unclaim`) comment. Returns True iff it landed.
+
+        Failures are NOT swallowed: a non-zero ``gh`` exit is logged at ERROR
+        with stderr so a silently-dropped comment can't masquerade as a posted
+        one (which previously turned every claim into a 180 s no-op timeout).
+        """
         verb = "/unclaim" if unclaim else "/claim"
         # `:08x` (8 hex nibbles) is intentional: it matches both the
         # _rosetta filename convention (FUN_<va_hex>.cpp) and upstream
@@ -182,7 +206,7 @@ class GitHubClaimBackend:
         # ceiling is shared with that parser and is safe for the 32-bit
         # PE images (no VA exceeds 0xFFFFFFFF) — keep the two in sync.
         body = f"{verb} FUN_{va:08x} {self.binary}"
-        subprocess.run(
+        r = subprocess.run(
             [
                 "gh",
                 "issue",
@@ -197,7 +221,45 @@ class GitHubClaimBackend:
             text=True,
             check=False,
         )
+        if r.returncode != 0:
+            log.error(
+                "FAILED to post `%s` on %s#%d (gh exit %d): %s",
+                body,
+                self.upstream,
+                self.claim_issue,
+                r.returncode,
+                (r.stderr or "").strip() or "<no stderr>",
+            )
+            return False
         log.info("posted `%s` on %s#%d", body, self.upstream, self.claim_issue)
+        return True
+
+    def _issue_at_cap(self) -> bool:
+        """True iff the coordination issue is at GitHub's comment cap.
+
+        Queried only after a post FAILS, to classify the failure as the
+        permanent cap (=> raise) vs a transient error (=> skip + retry next
+        VA). Best-effort: a failed lookup returns False so we don't abort on
+        an unrelated network blip.
+        """
+        r = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{self.upstream}/issues/{self.claim_issue}",
+                "--jq",
+                ".comments",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            return False
+        try:
+            return int(r.stdout.strip()) >= GH_ISSUE_COMMENT_CAP
+        except ValueError:
+            return False
 
     # --- ledger reading ---------------------------------------------------
 
@@ -254,7 +316,23 @@ class GitHubClaimBackend:
         someone else (we lost the race) — no point waiting out the window.
         """
         rva = va_to_rva(va, self.image_base)
-        self._post_claim_comment(va)
+        if not self._post_claim_comment(va):
+            # The comment never landed, so claim.yml will never fire and the
+            # ledger will never show our win — polling for poll_timeout_s would
+            # just burn the window. Classify the failure: a full issue is
+            # permanent (raise so the operator rotates DECOMP_CLAIM_ISSUE);
+            # anything else is treated as transient (skip this VA, try next).
+            if self._issue_at_cap():
+                raise ClaimIssueFullError(
+                    f"coordination issue {self.upstream}#{self.claim_issue} is "
+                    f"at GitHub's {GH_ISSUE_COMMENT_CAP}-comment cap — no claim "
+                    f"can be posted. Open a fresh issue and re-point "
+                    f"DECOMP_CLAIM_ISSUE at it."
+                )
+            log.warning(
+                "skipping claim FUN_%08x — comment post failed (transient?)", va
+            )
+            return False
         deadline = time.monotonic() + self.poll_timeout_s
         while time.monotonic() < deadline:
             time.sleep(self.poll_interval_s)

@@ -45,7 +45,7 @@ from .freeset import (
     rva_to_va,
     solved_rvas_from_ref,
 )
-from .github_claim import GitHubClaimBackend
+from .github_claim import ClaimIssueFullError, GitHubClaimBackend
 from .pr import build_pr_body, build_pr_title, create_pr
 from .pr_gate import run_pr_gate
 from .prompt_context import build_context, classify_tier
@@ -312,7 +312,15 @@ class DistributedAgent:
             if attempts >= self.cfg.max_attempts_per_worker:
                 break
             attempts += 1
-            status = await self.handle_one(fn)
+            try:
+                status = await self.handle_one(fn)
+            except ClaimIssueFullError as exc:
+                # Permanent: the coordination issue is at GitHub's comment cap,
+                # so NOTHING in this run (or any sibling shard) can claim. Stop
+                # the pass with EX_CONFIG (78) so start.sh halts this shard
+                # instead of hot-looping; the operator must rotate the issue.
+                log.error("%s", exc)
+                return 78
             log.info("FUN_%08x -> %s", rva_to_va(fn.rva), status)
             if status == "pr_opened":
                 opened += 1
