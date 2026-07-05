@@ -405,6 +405,25 @@ The orchestrator's design mirrors `jayminwest/overstory` — multi-agent
 with worktree isolation and a coordination database — adapted for
 meteor-decomp's specific build/diff loop.
 
+## Sister projects
+
+- **[meteor-decomp](https://github.com/swstegall/meteor-decomp)** —
+  clean-room decompilation of the FFXIV 1.23b Windows client binaries
+  that these agents grind through, producing byte-identical recompiles
+  and validated wire-protocol ground truth.
+- **[Garlemald Server](https://github.com/swstegall/Garlemald-Server)** —
+  Rust port of the FFXIV 1.23b server emulator (lobby / world / map),
+  backed by SQLite and 1,142 Lua content scripts.
+- **[Garlemald Client](https://github.com/swstegall/Garlemald-Client)** —
+  cross-platform Rust launcher that patches a 1.x install forward and
+  drives it against a private server (macOS / Linux / Windows).
+- **[XIV 1.0 Apple Silicon Installer](https://github.com/swstegall/XIV-1.0-Apple-Silicon-Installer)** —
+  one-command installer that stands up a working 1.23b client on Apple
+  Silicon Macs.
+- **[XIV 1.0 Linux Installer](https://github.com/swstegall/XIV-1.0-Linux-Installer)** —
+  one-command installer that stands up a working 1.23b client on x86_64
+  Linux, across distributions.
+
 ## License
 
 AGPL-3.0-or-later, matching `meteor-decomp/`.
